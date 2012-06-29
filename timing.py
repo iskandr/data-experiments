@@ -90,6 +90,7 @@ def random_split(X,Y):
 
 from collections import namedtuple 
 import timeit 
+import copy 
 def get_timings(X,Y, Xtest = None, Ytest = None): 
   n, d = X.shape
   
@@ -116,12 +117,17 @@ def get_timings(X,Y, Xtest = None, Ytest = None):
     if c > max_count: 
       max_count = c 
       max_label = l
-  print "n_classes = %d, most likely class = %d, p(%d) = %s" % (len(np.unique(Ytrain)), max_label, max_label, max_count / float(len(Ytrain))) 
+  prob_in_training = max_count / float(len(Ytrain))
+  prob_in_test = np.sum(Ytest == max_label) / float(len(Ytest))
+  print "n_classes = %d, most likely class = %d, p(%d in training) = %s, p(%d in test) = %s" % \
+    (len(np.unique(Ytrain)), max_label, max_label, prob_in_training, max_label, prob_in_test) 
   print 
   learning_algorithms = mk_classifiers(n_train) 
   results = {} 
   Result = namedtuple('Result', ('train_time', 'test_time', 'total_time', 'train_accuracy', 'test_accuracy', 'precision', 'recall'))
   for name, model in sorted(learning_algorithms.items()):
+    # copy the model so it doesn't take up space after we use it 
+    model = copy.deepcopy(model)
     print name
     result = None
     try:
