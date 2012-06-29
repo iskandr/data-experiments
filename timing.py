@@ -61,7 +61,7 @@ def mk_classifiers(n_samples):
     return GradientBoostingClassifier(max_depth = max_depth, \
       n_estimators = n_estimators, 
       subsample = subsample) 
-  for n_trees in [2,4,8,16,32,64,128, 256]:
+  for n_trees in [2,4,8,16,32,64,128]:
       classifiers['Random Forest (min_samples_leaf = 1, %d trees)' % n_trees] = mk_rf('gini', 1, n_trees)
       classifiers['Random Forest (min_samples_leaf = %d, %d trees)' % (log_samples, n_trees)] = mk_rf('gini', log_samples, n_trees)
       classifiers['Random Forest (min_samples_leaf = %d, %d trees)' % (sqrt_samples, n_trees)] = mk_rf('gini', sqrt_samples, n_trees)
@@ -108,6 +108,15 @@ def get_timings(X,Y, Xtest = None, Ytest = None):
   assert n_test == len(Ytest)
   
   print "n_train = %d, n_test = %d, n_dims = %d" % (n_train, n_test, d)
+  unique_labels = np.unique(Ytrain)
+  max_count = 0
+  max_label = 0
+  for l in unique_labels:
+    c = np.sum(Ytrain == l)
+    if c > max_count: 
+      max_count = c 
+      max_label = l
+  print "n_classes = %d, most likely class = %d, p(%d) = %s" % (len(np.unique(Ytrain)), max_label, max_label, max_count / float(len(Ytrain))) 
   print 
   learning_algorithms = mk_classifiers(n_train) 
   results = {} 
