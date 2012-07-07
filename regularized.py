@@ -25,6 +25,8 @@ class RegularizedQDA:
     ev = self.extra_variance 
     original_weight = 1.0 - a - p
     scaled_pooled_cov = p * np.cov(X.T)
+    assert scaled_pooled_cov.shape == I.shape
+    assert all([C.shape == I.shape for C in self.model.rotations])
     self.model.rotations = \
       [original_weight * C + \
        a * np.mean(np.diag(C)) * I + \

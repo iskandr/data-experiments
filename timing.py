@@ -70,7 +70,7 @@ def mk_classifiers(n_samples):
       classifiers['Gradient Boosting (sample size = 25%%, %d stumps)' % n_trees] = mk_boost(0.25, 3, n_trees)
 
   
-  for u in [2 * 10**6, 10**6, 500000, 250000]:
+  for u in [2 * 10**6, 10**6, 250000]:
     n_iter = int(np.ceil(u / float(n_samples)))
     classifiers['Linear SVM (SGD, %d updates / %d epochs)' % (u, n_iter)] = SGDClassifier(loss="hinge", n_iter = n_iter, shuffle=True)
     classifiers['Logisic Regression (SGD, %d updates / %d epochs)' % (u, n_iter)] = SGDClassifier(loss="log", n_iter = n_iter, shuffle = True)    
@@ -150,7 +150,7 @@ def get_timings(X,Y, Xtest = None, Ytest = None):
       train_time = t1 - t0
       test_time = t2 - t1
       result = Result(train_time, test_time, train_time + test_time, train_accuracy, test_accuracy, precision, recall)
-    except np.linalg.LinAlgError:
+    except (np.linalg.LinAlgError, AttributeError, MemoryError, OverflowError, ZeroDivisionError, AssertionError):
        print "Failed: ", sys.exc_info()
     results[name] = result 
     print result 
