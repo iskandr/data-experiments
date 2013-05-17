@@ -1,30 +1,47 @@
 # EXPECTS THE CIFAR-100 dataset to be in same directory 
 # as 'train' and 'test' pickled files 
 
+import cPickle
 import numpy 
 import numpy as np
 import pylab 
-import cPickle
-import theano 
+import theano
+import theano.tensor as T  
+from theano.tensor.nnet import conv 
+from theano.tensor.signal import downsample
+
+from logistic_sgd import LogisticRegression, load_data
+from mlp import HiddenLayer
+
+
 
 def unpickle(filename):
-    
     with open(filename, 'rb') as f:
         d = cPickle.load(f)
     return d
 
-train = unpickle('train')
-test = unpickle('test')
 meta = unpickle('meta')
+train = unpickle('train')
 
 
-train_set_x = train['data']
-train_set_y = train['fine_labels']
-print train_set_x
-print train_set_y
+xtrain = train['data']
+ytrain = train['fine_labels']
+print "Loaded training set, dims =", xtrain.shape
+xtrain_reshape = np.reshape(xtrain, (xtrain.shape[0], 32,32,3), order='F')
 
-test_set_x = test['data']
-test_set_y = test['fine_labels']
+#for i in xrange(100,110):
+#  pylab.figure()
+#  pylab.imshow(xtrain_reshape[i,:,:,:], interpolation="nearest")
+#pylab.show()
+
+
+
+
+test = unpickle('test')
+xtest = test['data']
+ytest = test['fine_labels']
+
+print "Loaded test set, dims =", xtest.shape
 
 
 class LeNetConvPoolLayer(object):
@@ -89,7 +106,7 @@ ishape = (3, npixels, npixels)
 batch_size = 20 
 
 # allocate symbolic variables for the data
-x = theano.floatX.xmatrix(theano.config.floatX)  # rasterized images
+x = T.matrix(theano.config.floatX)  # rasterized images
 y = T.lvector()  # the labels are presented as 1D vector of [long int] labels
 
 ##############################
