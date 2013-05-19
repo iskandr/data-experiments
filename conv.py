@@ -103,23 +103,92 @@ class ConvPoolLayer(object):
         # store parameters of this layer
         self.params = [self.W, self.b]
 
-class Accumulator(object):
+def combine(xs, ys):
+  assert isinstance(xs, ArrayList) or isinstance(ys, ArrayList)
+  if not isinstance(ys, ArrayList):
+    ys = ArrayList([ys] * len(xs))
+  elif not isinstance(xs, ArrayList):
+    xs = ArrayList([xs] * len(ys))
+  return xs.zip(ys)
+
+class ArrayList(object):
+  def __init__(self, arrays = []):
+    self.arrays = arrays
+
+  def __str__(self):
+    return "ArrayList(%s)" % ("; ".join(str(array.shape) for array in self.arrays))
+
+  def __len__(self):
+    return len(self.arrays)
+
+  def zip(self, other):
+    if np.isscalar(other):
+      other = [other] * len(self)
+    if isinstance(other, list):
+      other = ArrayList(other)
+    assert isinstance(other, ArrayList)
+    assert len(other) == len(self)
+    return ArrayList(zip(self.arrays, other.arrays))
+    
+  def __iter__(self):
+    return iter(self.arrays)
+
+  def dot(self, other):
+    return sum((x*y).sum() for x,y in combine(self,other))
+
+  def norm(self):
+    return np.sqrt(self.dot(self))
+
+  def __neg__(self):
+    return ArrayList([-x for x in self])
+
+  def __add__(self, other):
+    return ArrayList([x+y for x,y in combine(self, other)])
+
+  def __sub__(self, other):
+    return ArrayList([x-y for x,y in combine(self, other)])
+
+  
+  def __mul__(self, other):
+    return ArrayList([x*y for x, y in combine(self, other)])
+ 
+  def __rmul__(self, other):
+    return self * other
+
+  def __div__(self, other):
+    return ArrayList([x/y for x, y in combine(self, other)])
+
+class ArrayListAccumulator(object):
   def __init__(self):
     self.arrays = []
     self.n_updates = 0
 
   def add(self, xs):
     self.n_updates += 1
-    if len(self.arrays) == 0:
+    if not isinstance(xs, ArrayList):
+      xs = ArrayList(xs)
+    if len(self.arrays) == 0:  
       self.arrays = xs
     else:
-      self.arrays = add(xs, self.arrays)
+      self.arrays = self.arrays + xs
 
   def sums(self):
     return self.arrays
   
   def averages(self):
-    return [x / self.n_updates for x in self.arrays]
+    return self.arrays / self.n_updates 
+
+def mean(xss):
+  acc = ArrayListAccumulator()
+  for xs in xss:
+    acc.add(xs)
+  return acc.averages()
+
+def weighted_mean(xss, weights):
+  acc = Accumulator()
+  for xs, w in zip(xss, weights):
+    acc.add(mult(xs, w))
+  return acc.sums() / np.sum(weights)
 
 class Network(object): 
   def __init__(self,  
@@ -144,7 +213,7 @@ class Network(object):
     ######################
     # BUILD ACTUAL MODEL #
     ######################
-    print '... building the model'
+    print '  >> Building model: mini_batch_size = %d, learning_rate = %s, momentum = %s, n_filters = %s' % (mini_batch_size, learning_rate, momentum, n_filters)
 
     # Reshape matrix of rasterized images 
     # to a 4D tensor, compatible with our LeNetConvPoolLayer
@@ -209,9 +278,8 @@ class Network(object):
     self.bprop = theano.function([x, y], self.grads)
 
 
-
-  def get_weight_arrays(self):
-    return [p.get_value(borrow=True) for p in self.params]
+  def get_weights(self):
+    return ArrayList([p.get_value(borrow=True) for p in self.params])
 
   def add_to_weights(self, dxs):
     for p, dx in zip(self.params, dxs):
@@ -230,10 +298,10 @@ class Network(object):
     Get the average gradient across multiple mini-batches
     """
     combined_grads = []
-    acc = Accumulator()
+    acc = ArrayListAccumulator()
     def fn(xslice, yslice):
       acc.add([np.array(g) for g in self.bprop(xslice, yslice)])
-    for_each_slice(x, y, fn, self.mini_batch_size )
+    for_each_slice(x, y, fn, self.mini_batch_size)
     return acc.averages()
   
  
@@ -247,52 +315,13 @@ class Network(object):
       del dxs[0:len(dxs)]
       dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
-    final_weights = self.get_weight_arrays()
+    final_weights = self.get_weights()
     final_gradients = self.average_gradients(x,y)
     change_in_weights = [new_w - old_w for (new_w, old_w) in 
                          zip(initial_weights, final_weights)]
     change_in_gradients = [new_g - old_g for (new_g, old_g) in 
                            zip(initial_grads, final_gradients)]
     return final_weights, final_gradients, change_in_weights, change_in_gradients 
-
-def combine(xs,ys):
-  assert isinstance(xs, list) or isinstance(ys, list)
-  if not isinstance(ys, list):
-    ys = [ys] * len(xs)
-  elif not isinstance(xs, list):
-    xs = [xs] * len(ys)
-  return zip(xs, ys)
-
-def dot(array_list1, array_list2):
-  dots = [(x*y).sum() for x,y in combine(array_list1, array_list2)]
-  return np.sum(dots)
-
-def norm(array_list):
-  return np.sqrt(dot(array_list, array_list))
-
-def add(xs, ys):
-  return [x+y for x,y in combine(xs,ys)]
-
-def sub(xs, ys):
-  return [x-y for x,y in combine(xs,ys)]
-
-def mean(xss):
-  acc = Accumulator()
-  for xs in xss:
-    acc.add(xs)
-  return acc.averages()
-
-def mult(xs, ys):
-  return [x*y for x, y in combine(xs, ys)]
-
-def div(xs, ys):
-  return [x/y for x, y in combine(xs, ys)]
-
-def weighted_mean(xss, weights):
-  acc = Accumulator()
-  for xs, w in zip(xss, weights):
-    acc.add(mult(xs, w))
-  return acc.sums() / np.sum(weights)
 
  
 def for_each_slice(x, y, fn, mini_batch_size):
@@ -303,149 +332,198 @@ def for_each_slice(x, y, fn, mini_batch_size):
     yslice = y[start:stop]
     fn(xslice, yslice)
 
-def evaluate(global_learning_rate = 0.1, # if None, then do a line search  
-             local_learning_rate=0.01, 
-             global_momentum = 0, 
-             local_momentum = 0.01, 
-             n_workers = 2,         
-             newton = 'one-shot-lbfgs', 
-             worker_batch_size = 200, 
-             mini_batch_size = 20, 
-             n_epochs=200,
-             n_filters=[20, 50],
-             line_search_prct = 0.05,  
-             validation_prct = 0.05):
+class DistLearner(object):
+  def __init__(self, 
+               n_workers = 1,
+               n_epochs = 200, # how many passes over the data?
+               n_out = 10, # how many outputs?  
+               n_filters = [20, 50], # how many convolutions in the first two layers of the network?  
+               global_learning_rate = 0.1,  # step size for big steps of combined gradients
+               local_learning_rate = 0.01,  # step size on each worker
+               global_momentum = 0.05,  # momentum of global updates
+               local_momentum = 0.05,   # momentum on each worker 
+               mini_batch_size = 20,    # how many gradients does a worker average per local step?
+               n_local_steps = 2,       # how many mini-batch steps does a worker take?
+               approx_local_change = False, # if approx then compare first mini-batch vs. last mini-batch 
+               newton_method = 'memoryless-bfgs', # options = 'memoryless-bfgs', 'memoryless-bfgs-avg', 'svd', None
+               gradient_average = 'mean', # 'mean', 'best', 'weighted'
+               weight_average = 'mean'): # 'mean', 'best', 'weighted'
+    self.n_workers = n_workers
+    self.n_epochs = n_epochs
+    self.n_filters = n_filters 
+    self.global_learning_rate = global_learning_rate 
+    self.local_learning_rate = local_learning_rate 
+    self.global_momentum = global_momentum 
+    self.local_momentum = local_momentum 
+    self.mini_batch_size = mini_batch_size
+    self.n_local_steps = n_local_steps 
+    self.approx_local_change = approx_local_change 
+    self.newton_method = newton_method 
+    self.gradient_average = gradient_average 
+    self.weight_average = weight_average 
 
-
-    train_set_x, train_set_y, test_set_x, test_set_y  = \
-      load_data(labels='coarse_labels')
-    n_out = len(np.unique(test_set_y))
- 
-    ntrain, ncolors, image_rows, image_cols = train_set_x.shape
-    ntest = train_set_y.shape[0]
-    print "Train set:", train_set_x.shape
-    print "Test set:", test_set_x.shape
-   
-    #train_set_x = theano.shared(train_set_x)
-    #train_set_y = theano.shared(train_set_y)
-    #test_set_x = theano.shared(test_set_x)
-    #test_set_y = theano.shared(test_set_y) 
-   
-    # compute number of minibatches for training, validation and testing
-    n_test_batches = ntest / mini_batch_size 
-    worker_subset = ntrain / n_workers 
-    ###############
-    # TRAIN MODEL #
-    ###############
-    print '... training'
-    # early-stopping parameters
-    patience = 10000  # look as this many examples regardless
-    patience_increase = 2  # wait this much longer when a new best is
-                           # found
-    improvement_threshold = 0.995  # a relative improvement of this much is
-                                   # considered significant
-    validation_frequency = min(n_train_batches, patience / 2)
-                                  # go through this many
-                                  # minibatche before checking the network
-                                  # on the validation set; in this case we
-                                  # check every epoch
-
-    best_params = None
-    best_validation_loss = numpy.inf
-    best_iter = 0
-    test_score = 0.
-    start_time = time.clock()
-
-    epoch = 0
-    done_looping = False
-    nets = [Network(mini_batch_size = mini_batch_size, 
+    self.nets = [Network(mini_batch_size = mini_batch_size, 
                     learning_rate = local_learning_rate, 
                     momentum = local_momentum, 
                     n_filters = n_filters, 
                     n_out = n_out)
-           for _ in xrange(n_workers)]
+                 for _ in xrange(n_workers)]
 
-    while (epoch < n_epochs) and (not done_looping):
-        epoch = epoch + 1
-        shuffle_indices = np.arange(len(train_set_x))
+  def __str__(self):
+    attrs = ["%s = %s" % (k,self.__dict__[k]) for k in self.sorted_keys()]
+    s = ", ".join(attrs)
+    return "DistLearner(%s)" % s 
+  
+  def sorted_keys(self):
+    return sorted(self.__dict__.keys())
+  
+  def sorted_values(self):
+    return [self.__dict__[k] for k in self.sorted_keys()]
+  
+  def __eq__(self, other):
+    ks1 = self.sorted_keys()
+    ks2 = self.sorted_keys()
+    if len(ks1) != len(ks2):
+      return False
+    for (k1,k2) in zip(ks1,ks2):
+      if k1 != k2 or self.__dict__[k1] != other.__dict__[k2]:
+        return False 
+    return True
+ 
+  def __hash__(self):
+    return hash( (tuple(self.sorted_keys()), tuple(self.sorted_values())) )
+
+  def fit(self, train_set_x, train_set_y, shuffle = False):
+    ntrain, ncolors, image_rows, image_cols = train_set_x.shape
+    # compute number of minibatches for training, validation and testing
+    worker_batch_size = self.mini_batch_size * self.n_local_steps
+
+    start_time = time.clock()
+    for epoch in xrange(self.n_epochs):       
+      print "  epoch", epoch 
+      if shuffle:
+        shuffle_indices = np.arange(ntrain)
         np.random.shuffle(shuffle_indices)
         train_set_x = train_set_x[shuffle_indices]
         train_set_y = train_set_y[shuffle_indices]
-        ws = []
-        gs = []
-        ss = []
-        ys = []
-        for worker_idx in xrange(n_workers):
-          worker_start = worker_idx * worker_subset 
-          worker_stop = worker_start + worker_subset
-          
-          for batch_idx in xrange(worker_subset / worker_batch_size)
-            batch_start = worker_start + batch_idx * worker_batch_size
-            batch_stop = batch_start + worker_batch_size 
+      start_idx = 0 
+      while ntrain - start_idx >= worker_batch_size * self.n_workers: 
+          ws = []
+          gs = []
+          ss = []
+          ys = []
+          for worker_idx  in xrange(self.n_workers):
+              batch_start = start_idx + worker_idx * worker_batch_size
+              batch_stop = batch_start + worker_batch_size 
 
-            batch_x = train_set_x[batch_start:batch_stop]
-            batch_y = train_set_y[batch_start:batch_stop]
-             
-            # cost_ij = net.train_model(minibatch_x, minibatch_y)
-            w,g,s,y = net.update_batches(batch_x, batch_y)
-            ws.append(w)
-            gs.append(g)
-            ss.append(s)
-            ys.append(y)
+              batch_x = train_set_x[batch_start:batch_stop]
+              batch_y = train_set_y[batch_start:batch_stop]
+              w,g,s,y = self.nets[worker_idx].update_batches(batch_x, batch_y)
+              ws.append(w)
+              gs.append(g)
+              ss.append(s)
+              ys.append(y)
+           
           g = mean(gs)
           y = mean(ys)
           w = mean(ws)
           s = mean(ss)
-          #UUHHHHH TODO: make these BFGS steps happen after every 'worker_batch_size'
-          if newton:
-            rho = 1.0 / dot(s,y)
-            alpha = rho * dot(s,g)
-            g = sub(g, mult(alpha, y))
-            beta = rho * dot(y,g)
-            g = add(g, mult(s, (alpha-beta)))
-            
-            net.set_weights(add(w, mult(g, -global_learning_rate)))
-             
-               
-            if iter % 100 == 0: 
-              #print "Change in weights: ", norm(s)
-              #print "Change in gradients: ", norm(y)
-              def run_model(model, x, y):
-                scores = []
-                def fn(xslice, yslice):
-                  score = model(xslice, yslice)
-                  scores.append(score)
-                for_each_slice(x, y, fn, mini_batch_size)
-                return np.mean(scores)
-              test_score = run_model(net.test_model, test_set_x, test_set_y)
-              print "     epoch %i, minibatch %i/%i, test error of best model %f %%" %\
-                          (epoch, i + 1, n_train_batches, test_score * 100.)
-               
-
-            if patience <= iter:
-                done_looping = True
-                break
-
+          if self.newton_method is not None:
+              rho = 1.0 / s.dot(y)
+              alpha = rho * s.dot(g) 
+              g = g - alpha * y 
+              beta = rho * y.dot(g) 
+              g = g + s * (alpha - beta) 
+          change_in_weights = -self.global_learning_rate * g
+          for worker_idx in xrange(self.n_workers):
+            self.nets[worker_idx].add_to_weights(change_in_weights)
+          start_idx += worker_batch_size * self.n_workers 
     end_time = time.clock()
-    print('Optimization complete.')
-    print('Best validation score of %f %% obtained at iteration %i,'\
-          'with test performance %f %%' %
-          (best_validation_loss * 100., best_iter + 1, test_score * 100.))
-    print >> sys.stderr, ('The code for file ' +
-                          os.path.split(__file__)[1] +
-                          ' ran for %.2fm' % ((end_time - start_time) / 60.))
-    return best_validation_loss * 100.
+    elapsed = end_time - start_time 
+    return elapsed 
 
+  def score(self, test_set_x, test_set_y):
+    """
+    Return average accuracy on the test set
+    """
+    ntest = test_set_y.shape[0]
+    errs = []
+    def fn(xslice, yslice):
+      errs.append(self.nets[0].test_model(xslice, yslice))
+    for_each_slice(test_set_x, test_set_y, fn, self.mini_batch_size)
+    return 1 - np.mean(errs)
+
+def all_combinations(**params):
+  combos = [{}]
+  for (k,vs) in params.iteritems():
+    if not isinstance(vs, (tuple, list)):
+      vs = [vs]
+    new_combos = []
+    for v in vs:
+      for old_params in combos:
+        new_params = dict(old_params.iteritems())
+        new_params[k] = v
+        new_combos.append(new_params)
+    combos = new_combos
+  return combos 
+   
+
+from collections import namedtuple 
 if __name__ == '__main__':
-    evaluate(local_learning_rate = 0.1, local_momentum = 0.05)
-    for n_workers in [2]:
-      for local_batch_size in [100, 200]:
-        for mini_batch_size in [10, 50]:
-          for local_learning_rate in ['random', 0.01, 0.001]:
-            for global_learning_rate in ['search', 0.01, 0.001]: 
-              for combine_weights in ['weighted', 'mean']:
-                for combine_gradients in ['weighted', 'mean']:
-                  for newton in ['one-shot-lbfgs', 'global-lbfgs-1', 'global-lbfgs-5', None]:  
-                    pass 
+  param_combos = all_combinations(
+       n_workers = [1,2,4,8],
+       mini_batch_size = [10, 20, 40], 
+       n_local_steps = [2, 4, 8, 16],  
+       global_learning_rate = [0.1], 
+       local_learning_rate = [0.1, 0.01, 0.001],
+       weight_average = ['weighted', 'mean'],
+       gradient_average = ['weighted', 'mean'],
+       newton_method = [None, 'memoryless-bfgs', 'svd'])
+  print "Generated %d parameter combinations" % len(param_combos)
+  train_set_x, train_set_y, test_set_x, test_set_y  = \
+    load_data(labels='coarse_labels')
+  print "Train set:", train_set_x.shape
+  print "Test set:", test_set_x.shape
 
+  n_out = len(np.unique(test_set_y))
+  n_epochs = 3
+  best_acc = 0 
+  best_acc_model = None 
+  best_acc_time = None 
+
+
+  best_acc_rate = 0
+  best_acc_rate_model = None 
+  best_acc_rate_time = None 
+
+  for (i, params) in enumerate(param_combos[:3]):
+    print "Param #%d" % (i+1), ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
+    model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
+
+    elapsed_time = model.fit(train_set_x, train_set_y, shuffle = True)               
+    acc = model.score(test_set_x, test_set_y)
+
+    acc_rate = acc / elapsed_time 
+    print "  Elapsed time: %0.3f seconds" % elapsed_time
+    print "  Accuracy = %0.4f" %  (100.0 * acc)
+    print "  Accuracy per second = %0.4f" % (100.0 * acc_rate)     
+    print 
+
+    if acc > best_acc: 
+      best_acc = acc
+      best_acc_model = model 
+      best_acc_time = elapsed_time 
+    if acc_rate > best_acc_rate:
+      best_acc_rate = acc_rate 
+      best_acc_rate_model = model 
+      best_acc_rate_time = elapsed_time 
+
+    if i % 10 == 0:
+      print "=====" 
+      print "After %d parameter combinations" % (i+1) 
+      print "Best w/ accuracy-rate %0.3f, training time = %s, model = %s" % (best_acc_rate*100.0, best_acc_rate_time, best_acc_rate_model)
+      print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_model)
+      print "====="
+      print  
+    
 
