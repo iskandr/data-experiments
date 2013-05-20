@@ -257,8 +257,6 @@ class Network(object):
 
     # create a function to compute the mistakes that are made by the model
     self.test_model = theano.function([x,y], layer3.errors(y)) 
-    
-    self.validate_model = theano.function([x,y], layer3.errors(y)) 
     self.params = layer3.params + layer2.params + layer1.params + layer0.params
 
     # create a list of gradients for all model parameters
@@ -275,53 +273,120 @@ class Network(object):
 
     # self.train_model = theano.function([x,y], self.cost)# , updates=updates)
     # self.fprop = theano.function([x,y], self.cost)
-    self.bprop = theano.function([x, y], self.grads)
+    self.bprop_grads = theano.function([x, y], self.grads)
 
+    self.bprop_update = theano.function([x, y], self.cost, updates = updates)
+
+  def get_weights_list(self):
+    return [p.get_value(borrow=True) for p in self.params]
 
   def get_weights(self):
-    return ArrayList([p.get_value(borrow=True) for p in self.params])
+    return ArrayList(self.get_weights_list())
+ 
+  def get_weights_array(self):
+    weights_list = self.get_weights_list()
+    return self.flatten(self.get_weights_list())
 
-  def add_to_weights(self, dxs):
+  def flatten(self,arrays): 
+    elts_per_subarray = []
+    is_array = []
+    elt_type = None 
+    for w in arrays:
+      if isinstance(w, np.ndarray):
+        elts_per_subarray.append(w.size)
+        is_array.append(True)
+        if elt_type is None:
+          elt_type = w.dtype 
+      else:
+        assert np.isscalar(w)
+        elts_per_subarray.append(1)
+        is_array.append(False)
+    total_elts = sum(elts_per_subarray)
+    result = np.empty(shape = (total_elts,), dtype=elt_type)
+    curr_idx = 0
+    for (nelts, value) in zip(elts_per_subarray, arrays):
+      if np.rank(value) > 1:
+        value = np.ravel(value)
+      result[curr_idx:(curr_idx + nelts)] = value 
+      curr_idx += nelts 
+    return result
+ 
+  def add_list_to_weights(self, dxs):
+    """
+    Given a ragged list of arrays, add each to network params
+    """
     for p, dx in zip(self.params, dxs):
       old_value = p.get_value(borrow = True)
       old_value += dx 
       p.set_value(old_value, borrow=True)
    
-  def update_step(self, grads, old_dxs):
-    new_dxs = [-np.array(g) * self.learning_rate + self.momentum * old_dx
-               for g, old_dx in zip(grads, old_dxs)]
-    self.add_to_weights(new_dxs)
+  def add_array_to_weights(self, dxs):
+   """
+   Given a long weight vector, split it apart and each component to its layers' weights
+   """
+   curr_idx = 0
+   for p in self.params:
+     w = p.get_value(borrow=True)
+     if isinstance(w, np.ndarray):
+       nelts = w.size
+       w_flat = w.ravel()
+       # pray and hope the memory from ravel isn't fresh
+       w_flat += dxs[curr_idx:curr_idx+nelts]
+       assert w_flat.strides == dxs.strides
+       assert w.ctypes.data == w_flat.ctypes.data 
+       p.set_value(w, borrow=True)
+     else:
+       assert np.isscalar(w)
+       nelts = 1 
+       p.set_value(w + dxs[curr_idx])
+     curr_idx += nelts 
+
+  def local_update_step_with_momentum(self, grads, old_dxs):
+    new_dxs = []
+    for (g, old_dx) in zip(grads, old_dxs):
+      new_dx = np.array(g) 
+      new_dx *= -self.learning_rate 
+      old_dx *= self.momentum 
+      new_dx += old_dx 
+      new_dxs.append(new_dx)
+    self.add_list_to_weights(new_dxs)
     return new_dxs 
 
   def average_gradients(self, x, y):
     """
     Get the average gradient across multiple mini-batches
     """
-    combined_grads = []
-    acc = ArrayListAccumulator()
-    def fn(xslice, yslice):
-      acc.add([np.array(g) for g in self.bprop(xslice, yslice)])
-    for_each_slice(x, y, fn, self.mini_batch_size)
-    return acc.averages()
+    combined = None
+    n_batches = x.shape[0] / self.mini_batch_size
+    for batch_idx in xrange(n_batches):
+      start = batch_idx*self.mini_batch_size
+      stop = start + self.mini_batch_size
+      xslice = x[start:stop]
+      yslice = y[start:stop]
+      g_list = [np.array(g_elt) for g_elt in self.bprop_grads(xslice, yslice)]
+      g_flat = self.flatten(g_list)
+      if combined is None:
+        combined = g_flat
+      else:
+        combined += g_flat
+    combined /= n_batches
+    return combined 
   
- 
+  def get_state(self, x, y):
+    return self.get_weights_array(), self.average_gradients(x,y)
+       
   def update_batches(self, x, y):
-    initial_weights = [p.get_value(borrow=False) for p in self.params]
-    initial_grads = self.average_gradients(x,y) 
-    dxs = [0.0 for _ in initial_grads]
+    costs = []
     def fn(xslice, yslice):
-      grads = self.bprop(xslice, yslice)
-      new_dxs = self.update_step(grads, dxs)
-      del dxs[0:len(dxs)]
-      dxs.extend(new_dxs)
+      cost = self.bprop_update(xslice, yslice)
+      costs.append(cost)
+      # new_dxs = self.local_update_step(grads, dxs)
+      #del dxs[0:len(dxs)]
+      #dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
-    final_weights = self.get_weights()
-    final_gradients = self.average_gradients(x,y)
-    change_in_weights = [new_w - old_w for (new_w, old_w) in 
-                         zip(initial_weights, final_weights)]
-    change_in_gradients = [new_g - old_g for (new_g, old_g) in 
-                           zip(initial_grads, final_gradients)]
-    return final_weights, final_gradients, change_in_weights, change_in_gradients 
+    # print "  Mean batch cost: %0.3f" % np.mean(costs)
+    # compute changes by -original + final 
+    #return final_weights, final_grads, initial_weights, initial_grads 
 
  
 def for_each_slice(x, y, fn, mini_batch_size):
@@ -418,25 +483,67 @@ class DistLearner(object):
 
               batch_x = train_set_x[batch_start:batch_stop]
               batch_y = train_set_y[batch_start:batch_stop]
-              w,g,s,y = self.nets[worker_idx].update_batches(batch_x, batch_y)
+              net = self.nets[worker_idx]
+              if self.newton_method is not  None:
+                old_w, old_g = net.get_state(batch_x, batch_y) 
+              net.update_batches(batch_x, batch_y)
+              w,g = net.get_state(batch_x, batch_y)
               ws.append(w)
               gs.append(g)
-              ss.append(s)
-              ys.append(y)
-           
-          g = mean(gs)
-          y = mean(ys)
-          w = mean(ws)
-          s = mean(ss)
-          if self.newton_method is not None:
-              rho = 1.0 / s.dot(y)
-              alpha = rho * s.dot(g) 
-              g = g - alpha * y 
-              beta = rho * y.dot(g) 
-              g = g + s * (alpha - beta) 
-          change_in_weights = -self.global_learning_rate * g
+              if self.newton_method is not None:
+                s = w - old_w 
+                y = g - old_g 
+                ss.append(s)
+                ys.append(y)
+          if self.gradient_average == 'mean':
+            g = np.mean(gs,axis=0)
+          else:
+            assert False, "Not implemented: gradient_average = %s" % self.gradient_average 
+          if self.weight_average == 'mean':
+            w = np.mean(ws,axis=0)
+          else:
+            assert False, "Not implemented: weight_average = %s" % self.weight_average 
+ 
+          if self.newton_method == 'memoryless-bfgs':
+              rhos = []
+              alphas = []
+              for (s,y) in zip(ss,ys):
+                  rho = 1.0 / np.dot(s,y)
+                  rhos.append(rho)
+                  alpha = rho * np.dot(s,g)
+                  alphas.append(alpha)
+                  g -= alpha * y 
+              for (i,(s,y)) in reversed(list(enumerate(zip(ss,ys)))):
+                  alpha = alphas[i]
+                  rho = rhos[i]
+                  beta = rho * np.dot(y,g) 
+                  g += s * (alpha - beta)
+          elif self.newton_method == 'svd':
+              Y = np.array(ys)
+              S = np.array(ss)  
+              U, D, V = np.linalg.svd(Y.T, full_matrices=False)
+              diag_ratios = D / D[0] 
+              cutoff = 0.0001 
+              below_cutoff = diag_ratios < cutoff 
+              if np.any(below_cutoff):
+                k = np.argmax(below_cutoff)
+              else:
+                k = len(D)
+              # print "  SVD rank = %d / %d (D = %s)" % (k, len(D), D) 
+              k = np.argmax( (D / D[0]) < 10**-6) + 1
+              U = U[:, :k]
+              D = D[:k]
+              V = V[:k, :]
+              Ug = np.dot(U.T, g)
+              DinvUg = np.dot(np.diag(1.0 / D), Ug)
+              VDinvUg = np.dot(V.T, DinvUg)
+              g = np.dot(S.T, VDinvUg)                
+          else:
+              assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method 
+          
+          g *= -self.global_learning_rate  
           for worker_idx in xrange(self.n_workers):
-            self.nets[worker_idx].add_to_weights(change_in_weights)
+            self.nets[worker_idx].add_array_to_weights(g)
           start_idx += worker_batch_size * self.n_workers 
     end_time = time.clock()
     elapsed = end_time - start_time 
@@ -473,31 +580,48 @@ if __name__ == '__main__':
   param_combos = all_combinations(
        n_workers = [1,2,4,8],
        mini_batch_size = [10, 20, 40], 
-       n_local_steps = [2, 4, 8, 16],  
-       global_learning_rate = [0.1], 
-       local_learning_rate = [0.1, 0.01, 0.001],
-       weight_average = ['weighted', 'mean'],
-       gradient_average = ['weighted', 'mean'],
-       newton_method = [None, 'memoryless-bfgs', 'svd'])
+       n_local_steps = [ 4, 8, 16, 32],  
+       global_learning_rate = [5.0, 1.0, 0.5, 0.1], # TODO: 'search'
+       local_learning_rate = [0.1, 0.01, 0.001], # TODO: 'random'
+       global_momentum = [0.0], # TODO: 0.05 
+       local_momentum = [0.0], # TODO: 0.05 
+       weight_average = ['mean'], # TODO: weighted, best
+       gradient_average = ['mean'], # TODO: weighted, best 
+       newton_method = [ 'svd', 'memoryless-bfgs', None])
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
     load_data(labels='coarse_labels')
   print "Train set:", train_set_x.shape
   print "Test set:", test_set_x.shape
-
+  #train_set_x = train_set_x[:1000, :]
+  #train_set_y = train_set_y[:1000]
   n_out = len(np.unique(test_set_y))
   n_epochs = 3
   best_acc = 0 
+  best_acc_param = None
   best_acc_model = None 
   best_acc_time = None 
 
 
   best_acc_rate = 0
+  best_acc_rate_param = None
   best_acc_rate_model = None 
   best_acc_rate_time = None 
 
-  for (i, params) in enumerate(param_combos[:3]):
-    print "Param #%d" % (i+1), ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
+  def print_best(i):
+      print 
+      print "=====" 
+      print "After %d parameter combinations" % (i+1) 
+      print
+      print "Best w/ accuracy-rate %0.3f, training time = %s, model = %s" % (best_acc_rate*100.0, best_acc_rate_time, best_acc_rate_param)
+      print
+      print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_param)
+      print "====="
+      print  
+    
+  for (i, params) in enumerate(param_combos):
+    param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
+    print "Param #%d" % (i+1), param_str 
     model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
 
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = True)               
@@ -512,18 +636,17 @@ if __name__ == '__main__':
     if acc > best_acc: 
       best_acc = acc
       best_acc_model = model 
+      best_acc_params = param_str
       best_acc_time = elapsed_time 
     if acc_rate > best_acc_rate:
       best_acc_rate = acc_rate 
-      best_acc_rate_model = model 
+      best_acc_rate_model = model
+      best_acc_rate_param = param_str 
       best_acc_rate_time = elapsed_time 
 
     if i % 10 == 0:
-      print "=====" 
-      print "After %d parameter combinations" % (i+1) 
-      print "Best w/ accuracy-rate %0.3f, training time = %s, model = %s" % (best_acc_rate*100.0, best_acc_rate_time, best_acc_rate_model)
-      print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_model)
-      print "====="
-      print  
-    
-
+      print_best(i)
+  print
+  print "DONE!" 
+  print 
+  print_best(i)
