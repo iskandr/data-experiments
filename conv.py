@@ -275,6 +275,7 @@ class Network(object):
                      momentum, 
                      n_filters, 
                      n_out = 10,
+                     n_hidden = 300, # originally 500  
                      input_height = 32, 
                      input_width = 32, 
                      n_colors = 3):
@@ -325,10 +326,10 @@ class Network(object):
     # construct a fully-connected sigmoidal layer
     layer2 = \
       HiddenLayer(rng, input=layer2_input, n_in=n_filters[1] * filter_size[0] * filter_size[1],
-                  n_out=500, activation=T.tanh)
+                  n_out=n_hidden, activation=T.tanh)
 
     # classify the values of the fully-connected sigmoidal layer
-    layer3 = LogisticRegression(input=layer2.output, n_in=500, n_out=n_out)
+    layer3 = LogisticRegression(input=layer2.output, n_in=n_hidden, n_out=n_out)
 
     # the cost we minimize during training is the NLL of the model
     self.cost = layer3.negative_log_likelihood(y)
@@ -353,7 +354,7 @@ class Network(object):
     # self.fprop = theano.function([x,y], self.cost)
     self.bprop_grads = theano.function([x, y], self.grads)
 
-    self.bprop_update = theano.function([x, y], self.grads, updates = updates)
+    self.bprop_update = theano.function([x, y], self.cost, updates = updates)
      
     #self.bprop_update = theano.function([x, y], self.cost)
 
@@ -470,10 +471,11 @@ class Network(object):
     """
     Get the average gradient across multiple mini-batches
     """
-    combined = None
     n_batches = x.shape[0] / self.mini_batch_size
     if n_batches == 1:
       return self.get_gradients(x,y)
+    w = 1.0 / n_batches 
+    combined = None 
     for batch_idx in xrange(n_batches):
       start = batch_idx*self.mini_batch_size
       stop = start + self.mini_batch_size
@@ -482,9 +484,9 @@ class Network(object):
       g_flat = self.get_gradients(xslice, yslice)
       if combined is None:
         combined = g_flat
+        combined *= w  
       else:
-        combined += g_flat
-    combined /= n_batches
+        combined = combined.mul_add(1.0, g_flat, w)
     return combined 
   
   def get_state(self, x, y):
@@ -494,14 +496,15 @@ class Network(object):
     """
     Returns list containing most recent gradients
     """
-    grads = [None] 
+    costs = [] 
     def fn(xslice, yslice):
-      grads[0] = self.bprop_update(xslice, yslice)
+      c = self.bprop_update(xslice, yslice)
+      costs.append(c)
       # new_dxs = self.local_update_step(grads, dxs)
       #del dxs[0:len(dxs)]
       #dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
-    return grads[0]
+    return np.mean(costs)
     # return np.mean(costs) / self.mini_batch_size 
     # print "  Mean batch cost: %0.3f" % np.mean(costs)
     # compute changes by -original + final 
@@ -519,9 +522,9 @@ def for_each_slice(x, y, fn, mini_batch_size):
 class DistLearner(object):
   def __init__(self, 
                n_workers = 1,
-               n_epochs = 200, # how many passes over the data?
+               n_epochs = 20, # how many passes over the data?
                n_out = 10, # how many outputs?  
-               n_filters = [20, 50], # how many convolutions in the first two layers of the network?  
+               n_filters = [64, 20], # how many convolutions in the first two layers of the network?  
                global_learning_rate = 0.1,  # step size for big steps of combined gradients
                local_learning_rate = 0.01,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -598,26 +601,32 @@ class DistLearner(object):
           gs = []
           ss = []
           ys = []
+          
           for worker_idx  in xrange(self.n_workers):
-              batch_start = start_idx + worker_idx * worker_batch_size
+              # batch_start = start_idx + worker_idx * worker_batch_size
+              if worker_idx == 0:
+                batch_start = start_idx
+              else:
+                batch_start = np.random.randint(0, ntrain-worker_batch_size)
               batch_stop = batch_start + worker_batch_size 
 
               batch_x = train_set_x[batch_start:batch_stop]
               batch_y = train_set_y[batch_start:batch_stop]
               net = self.nets[worker_idx]
               if self.newton_method is not None:
-                old_w, old_g = net.get_state(batch_x[:self.mini_batch_size], batch_y[:self.mini_batch_size]) 
-                # old_w, old_g = net.get_state(batch_x, batch_y)
-              grads_list = net.update_batches(batch_x, batch_y)
+                # make sure gradients from each worker are on the same data
+                grad_start = np.random.randint(0, ntrain-self.mini_batch_size)
+                grad_stop = grad_start + self.mini_batch_size 
+                grad_set_x = train_set_x[grad_start:grad_stop]
+                grad_set_y = train_set_y[grad_start:grad_stop]
+                old_w, old_g = net.get_state(grad_set_x, grad_set_y)
+              net.update_batches(batch_x, batch_y)
               if not simple_backprop:
-                g = net.flatten(grads_list)  
-	        w = net.get_weights() #net.get_state(batch_x, batch_y)
+                w, g = net.get_state(grad_set_x, grad_set_y)
                 ws.append(w)
                 gs.append(g)
                 if self.newton_method is not None:
-                  # w - old_w 
                   s = w.mul_add(1.0, old_w, -1.0)
-                  # y = g - old_g 
                   y = w.mul_add(1.0, old_g, -1.0)
                   ss.append(s)
                   ys.append(y)
@@ -626,7 +635,8 @@ class DistLearner(object):
             print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
             last_print_time = curr_t 
             last_print_idx = start_idx 
-          start_idx += worker_batch_size * self.n_workers 
+          # start_idx += worker_batch_size * self.n_workers  # SPLITTING DATA BETWEEN WORKERS SUCKS
+          start_idx += worker_batch_size 
           if simple_backprop:
             continue
           if self.gradient_average == 'mean':
@@ -648,14 +658,19 @@ class DistLearner(object):
                   assert s.shape == g.shape, s.shape
                   assert y.shape == g.shape, y.shape
                   rho = 1.0 / dot(s,y)
+                  assert np.isscalar(rho)
                   rhos.append(rho)
                   alpha = rho * dot(s,g) 
+                  assert np.isscalar(alpha)
                   alphas.append(alpha)
                   g = g.mul_add(1.0, y, -alpha)
-              for (i,(s,y)) in reversed(list(enumerate(zip(ss,ys)))):
+              for i in reversed(range(self.n_workers)):
+                  s = ss[i]
+                  y = ys[i]
                   alpha = alphas[i]
                   rho = rhos[i]
                   beta = rho * dot(y,g)
+                  assert np.isscalar(beta)
                   g = g.mul_add(1.0, s, alpha-beta)
           elif self.newton_method == 'svd':
               
@@ -677,21 +692,16 @@ class DistLearner(object):
               VDinvUg = np.dot(V.T, DinvUg)
               search_dir = np.dot(S.T, VDinvUg)
               """
-              #start_t = time.time()
               Y = concat(ys) 
               S = concat(ss)
-              #get_start_t = time.time() 
+              
               Y = Y.get()
               g = g.get()
-              #get_stop_t = time.time()
                
-              #svd_start_t = time.time()
               V,D,U = np.linalg.svd(Y, full_matrices=False)
-              #svd_stop_t = time.time()
-              diag_ratios = D / D[0] 
-              cutoff = 0.0001 
-              if diag_ratios.min() < cutoff:
-                k = argmax(diag_ratios < cutoff)
+              cutoff = 0.0001 * D[0]
+              if D.min() < cutoff:
+                k = argmax(D < cutoff)
               else:
                 k = len(D)
               U = U[:k, :]
@@ -701,17 +711,9 @@ class DistLearner(object):
               g = np.dot(U, g)
               g *= (1.0 / D) 
               g = np.dot(V, g)
-              #put_start_t = time.time()
               g = pycuda.gpuarray.to_gpu(g) 
-              #put_stop_t = time.time()
               g = dot(g, S)
               
-              #stop_t = time.time()
-              #d_total = stop_t - start_t
-              #d_transfer = (get_stop_t - get_start_t) + (put_stop_t - put_start_t)
-              #d_svd = svd_stop_t - svd_start_t 
-              #d_misc = d_total - d_transfer - d_svd 
-              #print "Total time %0.3f, transfer time %0.3f, SVD time %0.3f, misc compute %0.3f" % (d_total, d_transfer, d_svd, d_misc) 
           elif self.newton_method == 'svd-gpu':
               print "  GPU SVD step"
               total_start = time.time()
@@ -812,17 +814,19 @@ def all_combinations(**params):
 
 from collections import namedtuple 
 if __name__ == '__main__':
+  global_learning_rates = [0.1, 1.0, 2.5]
+
   param_combos = all_combinations(
-       n_workers = [1,4],
-       mini_batch_size = [50, 200], 
-       n_local_steps = [ 1, 4],  
-       global_learning_rate = [0.1, 1.0], # TODO: 'search'
-       local_learning_rate = [0.1, 0.01, 0.001], # TODO: 'random'
+       n_workers = [2,1],
+       mini_batch_size = [64], 
+       n_local_steps = [ 2, 10],  
+       global_learning_rate = global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
+       local_learning_rate = [0.1, 0.01], #, 0.001], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
        weight_average = ['mean'], # TODO: weighted, best
        gradient_average = ['mean'], # TODO: weighted, best 
-       newton_method = [ 'svd', None, 'memoryless-bfgs'])
+       newton_method = ['memoryless-bfgs', None, 'svd', ])
 
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
@@ -836,31 +840,30 @@ if __name__ == '__main__':
   best_acc_model = None 
   best_acc_time = None 
 
-
-  best_acc_rate = 0
-  best_acc_rate_param = None
-  best_acc_rate_model = None 
-  best_acc_rate_time = None 
+  accs = []
 
   def print_best(i):
       print 
       print "=====" 
       print "After %d parameter combinations" % (i+1) 
       print
-      print "Best w/ accuracy-rate %0.3f, training time = %s, model = %s" % (best_acc_rate*100.0, best_acc_rate_time, best_acc_rate_param)
-      print
+      print "Accuracies: min %0.3f, max %0.3f, median %0.3f" % (np.min(accs), np.max(accs), np.median(accs))
+      print 
       print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_param)
       print "====="
       print  
-    
+  
   for (i, params) in enumerate(param_combos):
+    if params['n_workers'] == 1 and params['newton_method'] is None and params['global_learning_rate'] != np.min(global_learning_rates):
+      continue
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
     print "Param #%d" % (i+1), param_str 
     model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
 
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
-
+    accs.append(acc)
+    
     baseline = 1.0 / n_out 
     acc_rate = (acc - baseline) / elapsed_time 
     print "  Elapsed time: %0.3f seconds" % elapsed_time
@@ -873,11 +876,6 @@ if __name__ == '__main__':
       best_acc_model = model 
       best_acc_param = param_str
       best_acc_time = elapsed_time 
-    if acc_rate > best_acc_rate:
-      best_acc_rate = acc_rate 
-      best_acc_rate_model = model
-      best_acc_rate_param = param_str 
-      best_acc_rate_time = elapsed_time 
 
     
     print_best(i)
