@@ -384,6 +384,7 @@ class Network(object):
       #del dxs[0:len(dxs)]
       #dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
+    return np.mean(costs) / self.mini_batch_size 
     # print "  Mean batch cost: %0.3f" % np.mean(costs)
     # compute changes by -original + final 
     #return final_weights, final_grads, initial_weights, initial_grads 
@@ -472,11 +473,13 @@ class DistLearner(object):
         train_set_x = train_set_x[shuffle_indices]
         train_set_y = train_set_y[shuffle_indices]
       start_idx = 0 
+      last_print_idx = 0
       while ntrain - start_idx >= worker_batch_size * self.n_workers: 
           ws = []
           gs = []
           ss = []
           ys = []
+          costs = []
           for worker_idx  in xrange(self.n_workers):
               batch_start = start_idx + worker_idx * worker_batch_size
               batch_stop = batch_start + worker_batch_size 
@@ -486,7 +489,7 @@ class DistLearner(object):
               net = self.nets[worker_idx]
               if self.newton_method is not  None:
                 old_w, old_g = net.get_state(batch_x, batch_y) 
-              net.update_batches(batch_x, batch_y)
+              costs = net.update_batches(batch_x, batch_y)
               w,g = net.get_state(batch_x, batch_y)
               ws.append(w)
               gs.append(g)
@@ -495,6 +498,10 @@ class DistLearner(object):
                 y = g - old_g 
                 ss.append(s)
                 ys.append(y)
+          cost = np.mean(costs)
+          if start_idx - last_print_idx >= 100:
+            print "  Sample %d / %d, mean batch cost = %0.3f" % (start_idx, ntrain, cost) 
+            last_print_idx = start_idx 
           if self.gradient_average == 'mean':
             g = np.mean(gs,axis=0)
           else:
@@ -578,16 +585,16 @@ def all_combinations(**params):
 from collections import namedtuple 
 if __name__ == '__main__':
   param_combos = all_combinations(
-       n_workers = [1,2,4,8],
-       mini_batch_size = [10, 20, 40], 
-       n_local_steps = [ 4, 8, 16, 32],  
-       global_learning_rate = [5.0, 1.0, 0.5, 0.1], # TODO: 'search'
+       n_workers = [1,8],
+       mini_batch_size = [10, 50], 
+       n_local_steps = [ 5, 20],  
+       global_learning_rate = [5.0, 1.0, 0.1], # TODO: 'search'
        local_learning_rate = [0.1, 0.01, 0.001], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
        weight_average = ['mean'], # TODO: weighted, best
        gradient_average = ['mean'], # TODO: weighted, best 
-       newton_method = [ 'svd', 'memoryless-bfgs', None])
+       newton_method = [None, 'svd', 'memoryless-bfgs'])
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
     load_data(labels='coarse_labels')
@@ -596,7 +603,7 @@ if __name__ == '__main__':
   #train_set_x = train_set_x[:1000, :]
   #train_set_y = train_set_y[:1000]
   n_out = len(np.unique(test_set_y))
-  n_epochs = 3
+  n_epochs = 1
   best_acc = 0 
   best_acc_param = None
   best_acc_model = None 
