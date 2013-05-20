@@ -258,7 +258,7 @@ class Network(object):
     # create a function to compute the mistakes that are made by the model
     self.test_model = theano.function([x,y], layer3.errors(y)) 
     self.params = layer3.params + layer2.params + layer1.params + layer0.params
-
+    
     # create a list of gradients for all model parameters
     self.grads = T.grad(self.cost, self.params)
 
@@ -306,9 +306,10 @@ class Network(object):
     curr_idx = 0
     for (nelts, value) in zip(elts_per_subarray, arrays):
       if np.rank(value) > 1:
-        value = np.ravel(value)
+        value = np.ravel(value, order='C')
       result[curr_idx:(curr_idx + nelts)] = value 
-      curr_idx += nelts 
+      curr_idx += nelts
+    assert curr_idx == total_elts  
     return result
  
   def add_list_to_weights(self, dxs):
@@ -329,7 +330,7 @@ class Network(object):
      w = p.get_value(borrow=True)
      if isinstance(w, np.ndarray):
        nelts = w.size
-       w_flat = w.ravel()
+       w_flat = w.ravel(order='C')
        # pray and hope the memory from ravel isn't fresh
        w_flat += dxs[curr_idx:curr_idx+nelts]
        assert w_flat.strides == dxs.strides
@@ -347,13 +348,14 @@ class Network(object):
      w = p.get_value(borrow=True)
      if isinstance(w, np.ndarray):
        nelts = w.size
-       new_reshaped = np.reshape(new_w[curr_idx:curr_idx+nelts], w.shape)
+       new_reshaped = np.reshape(new_w[curr_idx:curr_idx+nelts], w.shape, order='C') 
        p.set_value(new_reshaped)
      else:
        assert np.isscalar(w)
        nelts = 1 
        p.set_value(new_w[curr_idx])
      curr_idx += nelts 
+   assert curr_idx == len(new_w)
   
   def local_update_step_with_momentum(self, grads, old_dxs):
     new_dxs = []
@@ -473,7 +475,7 @@ class DistLearner(object):
   def __hash__(self):
     return hash( (tuple(self.sorted_keys()), tuple(self.sorted_values())) )
 
-  def fit(self, train_set_x, train_set_y, shuffle = False, print_frequency = 250):
+  def fit(self, train_set_x, train_set_y, shuffle = False, print_frequency = 1000):
     ntrain, ncolors, image_rows, image_cols = train_set_x.shape
     # compute number of minibatches for training, validation and testing
     worker_batch_size = self.mini_batch_size * self.n_local_steps
@@ -566,10 +568,8 @@ class DistLearner(object):
               g = np.dot(S.T, VDinvUg)                
           else:
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method 
-          
-           
-          g *= -self.global_learning_rate  
-          w += g
+          g *= self.global_learning_rate  
+          w -= g
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
     end_time = time.clock()
@@ -621,8 +621,8 @@ if __name__ == '__main__':
     load_data(labels='coarse_labels')
   print "Train set:", train_set_x.shape
   print "Test set:", test_set_x.shape
-  #train_set_x = train_set_x[:1000, :]
-  #train_set_y = train_set_y[:1000]
+  train_set_x = train_set_x[:1000, :]
+  train_set_y = train_set_y[:1000]
   n_out = len(np.unique(test_set_y))
   n_epochs = 1
   best_acc = 0 
@@ -652,10 +652,11 @@ if __name__ == '__main__':
     print "Param #%d" % (i+1), param_str 
     model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
 
-    elapsed_time = model.fit(train_set_x, train_set_y, shuffle = True)               
+    elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
 
-    acc_rate = acc / elapsed_time 
+    baseline = 1.0 / n_out 
+    acc_rate = (acc - baseline) / elapsed_time 
     print "  Elapsed time: %0.3f seconds" % elapsed_time
     print "  Accuracy = %0.4f" %  (100.0 * acc)
     print "  Accuracy per second = %0.4f" % (100.0 * acc_rate)     
