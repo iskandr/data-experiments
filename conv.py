@@ -133,11 +133,11 @@ def mean(gpu_arrays):
   return acc 
 
 def weighted_mean(gpu_arrays, weights):
-  acc = gpu_copy(gpu_arrays[0])
+  acc = gpu_arrays[0]
   weights /= np.sum(weights)
   acc *= weights[0]
   for x, w in zip(gpu_arrays[1:], weights[1:]):
-    acc.mul_add(1.0, x, w)
+    acc.mul_add(1.0, x, w) 
   return acc 
 
 def memcpy(dest, src):
@@ -598,6 +598,12 @@ class DistLearner(object):
     worker_batch_size = self.mini_batch_size * self.n_local_steps
     simple_backprop = self.n_workers == 1 and self.newton_method is False
     start_time = time.clock()
+    def get_validation_set():
+        validation_start = np.random.randint(0, ntrain - self.mini_batch_size)
+        validation_stop = validation_start + self.mini_batch_size
+        val_x = train_set_x[validation_start:validation_stop]
+        val_y = train_set_y[validation_start:validation_stop]
+        return val_x, val_y 
     for epoch in xrange(self.n_epochs):       
       print "  epoch", epoch 
       if shuffle:
@@ -610,11 +616,8 @@ class DistLearner(object):
       last_print_time = time.time()
       while ntrain - start_idx >= worker_batch_size * self.n_workers: 
           
-          validation_start = np.random.randint(0, ntrain - self.mini_batch_size)
-          validation_stop = validation_start + self.mini_batch_size
-          val_x = train_set_x[validation_start:validation_stop]
-          val_y = train_set_y[validation_start:validation_stop]
-          
+          if not simple_backprop:
+            val_x, val_y = get_validation_set()
           ws = []
           gs = []
           ss = []
@@ -659,12 +662,13 @@ class DistLearner(object):
           if simple_backprop:
             continue
 
-          centered_costs = np.array(costs) - np.mean(costs)
-          scaled_costs = centered_costs / np.std(costs)
-          # a low cost is negative, flip the sign to give it a large weight
-          weights = np.exp(-scaled_costs)
-          weights /= np.sum(weights) 
-          
+          if self.gradient_average == 'weighted' or self.weight_average == 'weighted':
+            centered_costs = np.array(costs) - np.mean(costs)
+            scaled_costs = centered_costs / np.std(costs)
+            # a low cost is negative, flip the sign to give it a large weight
+            weights = np.exp(-scaled_costs)
+            weights /= np.sum(weights) 
+
           if self.gradient_average == 'mean':
             g = mean(gs)
           elif self.gradient_average == 'best':
@@ -691,7 +695,8 @@ class DistLearner(object):
               #print "  -- gradient shape", g.shape
               rhos = []
               alphas = []
-              #norm_before = norm(g) #np.sqrt(dot(g,g))
+              if self.global_learning_rate != 'search':
+                norm_before = norm(g) #np.sqrt(dot(g,g))
               for (s,y) in zip(ss,ys):
                   rho = 1.0 / dot(s,y)
                   rhos.append(rho)
@@ -706,11 +711,12 @@ class DistLearner(object):
                   beta = rho * dot(y,g)
                   g = g.mul_add(1.0, s, alpha-beta)
 
-              # until we have a line search, 
+              # if we don't have a line search, 
               # should normalize the search direction 
               # since it can grow several orders of magnitude 
-              #norm_after = norm(g) #np.sqrt(dot(g,g))
-              #rescale_gradient = norm_before / norm_after 
+              if self.global_learning_rate != 'search':
+                norm_after = norm(g) #np.sqrt(dot(g,g))
+                rescale_gradient = norm_before / norm_after 
           elif self.newton_method == 'svd':
               
               """
@@ -813,7 +819,7 @@ class DistLearner(object):
           else:
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
-          
+            val_x, val_y = get_validation_set()
             etas = 10.0 ** np.arange(2, -5, -1) 
             ws = []
             w_best = None
@@ -872,14 +878,14 @@ if __name__ == '__main__':
 
   param_combos = all_combinations(
        n_workers = [4,1], 
-       mini_batch_size = [64], 
-       n_local_steps = [ 20, 5],  
+       mini_batch_size = [256, 64], 
+       n_local_steps = [ 50, 20, 5 ],  
        global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.1, 0.01, 0.001], # TODO: 'random'
+       local_learning_rate = [0.1, 0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
-       weight_average = ['best', 'weighted'], # TODO: weighted, best
-       gradient_average = ['best', 'weighted'], # TODO: weighted, best 
+       weight_average = ['best'], 
+       gradient_average = ['best'],  
        newton_method = ['svd', None, 'memoryless-bfgs' ])
 
   print "Generated %d parameter combinations" % len(param_combos)
@@ -888,7 +894,7 @@ if __name__ == '__main__':
   print "Train set:", train_set_x.shape
   print "Test set:", test_set_x.shape
   n_out = len(np.unique(test_set_y))
-  n_epochs = 3
+  n_epochs = 20
   best_acc = 0 
   best_acc_param = None
   best_acc_model = None 
