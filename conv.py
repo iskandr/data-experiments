@@ -574,7 +574,7 @@ class DistLearner(object):
                n_workers = 1,
                n_epochs = 20, # how many passes over the data?
                n_out = 10, # how many outputs?  
-               n_filters = [64, 25], # how many convolutions in the first two layers of the network?  
+               n_filters = [64, 32], # how many convolutions in the first two layers of the network?  
                global_learning_rate = 0.1,  # step size for big steps of combined gradients
                local_learning_rate = 0.01,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -640,36 +640,35 @@ class DistLearner(object):
     simple_backprop = self.n_workers == 1 and self.newton_method is False
     start_time = time.clock()
     def get_shuffled_set():
-      start_t = time.time()
       shuffle_indices = np.arange(ntrain)
       np.random.shuffle(shuffle_indices)
-      x,y= train_set_x.take(shuffle_indices, axis=0), train_set_y.take(shuffle_indices)
-      stop_t = time.time()
-      print "Shuffle time", stop_t - start_t 
-      return x,y
+      return train_set_x.take(shuffle_indices, axis=0), train_set_y.take(shuffle_indices)
     # use these to draw validation sets to avoid 
     # overlap with parallel training sets 
-    shuffled_x, shuffled_y = get_shuffled_set()   
+    shuffled_x, shuffled_y = get_shuffled_set()  
+ 
+    n_acc_val = 2000 
+    acc_val_x, acc_val_y = shuffled_x[:n_acc_val], shuffled_y[:n_acc_val]
+    shuffled_x, shuffled_y = shuffled_x[n_acc_val:], shuffled_y[n_acc_val:]
     
-    def get_validation_set():
-        validation_start = np.random.randint(0, ntrain - self.mini_batch_size)
-        validation_stop = validation_start + self.mini_batch_size
+    def get_validation_set(size = self.mini_batch_size):
+        validation_start = np.random.randint(0, len(shuffled_y) - size)
+        validation_stop = validation_start + size 
         val_x = shuffled_x[validation_start:validation_stop]
         val_y = shuffled_y[validation_start:validation_stop]
         return val_x, val_y
-
+    
     for epoch in xrange(self.n_epochs):       
       if shuffle:
         train_set_x, train_set_y = get_shuffled_set()
       start_idx = 0 
-      last_print_idx = 0
-      last_print_time = time.time()
-      # used for momentum 
+      # will eventually be used for momentum 
       dw = None
       while ntrain - start_idx >= worker_batch_size * self.n_workers: 
           
           if not simple_backprop:
             val_x, val_y = get_validation_set()
+             
           ws = []
           gs = []
           ss = []
@@ -705,15 +704,7 @@ class DistLearner(object):
                 y = last_g.mul_add(1.0, old_g, -1.0)
                 ss.append(s)
                 ys.append(y)
-          if start_idx - last_print_idx >= print_frequency:
-            curr_t = time.time()
-            #print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
-            if len(costs) > 0:
-             
-              print "  -- worker costs", [float(c) for c in costs]
-            last_print_time = curr_t 
-            last_print_idx = start_idx 
-          # start_idx += worker_batch_size * self.n_workers  # SPLITTING DATA BETWEEN WORKERS SUCKS
+          
           start_idx += worker_batch_size 
           if simple_backprop:
             continue
@@ -848,6 +839,7 @@ class DistLearner(object):
               
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
+      print "Epoch %d -- validation accuracy = %0.3f" % (epoch, self.score(acc_val_x, acc_val_y) * 100)
     end_time = time.clock()
     elapsed = end_time - start_time 
     return elapsed 
@@ -886,16 +878,16 @@ from collections import namedtuple
 if __name__ == '__main__':
 
   param_combos = all_combinations(
-       n_workers = [2], 
-       mini_batch_size = [64], 
+       n_workers = [4], 
+       mini_batch_size = [32], 
        n_local_steps = [ 10 ],  
-       global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.1], # TODO: 'random'
+       global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
+       local_learning_rate = [0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
        weight_average = ['best',], 
        gradient_average = ['best', 'weighted'],  
-       newton_method = [None, 'svd', 'memoryless-bfgs' ], 
+       newton_method = ['svd', 'memoryless-bfgs', None ], 
        conv_activation = ['relu', 'tanh'],
   ) 
 
@@ -966,7 +958,7 @@ if __name__ == '__main__':
   f.close()
   keys = results.keys()
   values = results.values()
-  sorted_indices = sorted(range(len(results)), key = lambda i: results.values()[i])
+  sorted_indices = np.argsort(values) 
   for idx in sorted_indices:
     print "%0.3f %s" %   (values[i], keys[i])
 
