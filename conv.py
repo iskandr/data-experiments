@@ -47,7 +47,11 @@ from pycuda.gpuarray import GPUArray
 
 import scikits.cuda 
 import scikits.cuda.linalg
+
 scikits.cuda.linalg.init() 
+
+import scikits.cuda.cublas as cublas 
+cublas_handle =  cublas.cublasCreate()
 
 rng = numpy.random.RandomState(23455)
 
@@ -198,6 +202,12 @@ def dot(x,y):
       return result 
   else:
     return np.dot(x,y)
+
+def norm(x):
+  if isinstance(x, GPUArray):
+    return cublas.cublasSnrm2(cublas_handle, x.size, x.gpudata, 1)
+  else:
+    return np.linalg.norm(x) 
 
 def diag_dot(diag, X):
   """
@@ -354,9 +364,8 @@ class Network(object):
     # self.fprop = theano.function([x,y], self.cost)
     self.bprop_grads = theano.function([x, y], self.grads)
 
-    self.bprop_update = theano.function([x, y], self.cost, updates = updates)
-     
-    #self.bprop_update = theano.function([x, y], self.cost)
+    self.bprop_update = theano.function([x, y], self.grads, updates = updates) 
+    self.cost_fn = theano.function([x, y], self.cost)
 
   def get_weights_list(self):
     return [p.get_value(borrow=True) for p in self.params]
@@ -496,15 +505,17 @@ class Network(object):
     """
     Returns list containing most recent gradients
     """
-    costs = [] 
+    #costs = [] 
+    gs = [None]
     def fn(xslice, yslice):
-      c = self.bprop_update(xslice, yslice)
-      costs.append(c)
+      g_list = self.bprop_update(xslice, yslice)
+      gs[0] = g_list
       # new_dxs = self.local_update_step(grads, dxs)
       #del dxs[0:len(dxs)]
       #dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
-    return np.mean(costs)
+    return gs[0]
+    #return np.mean(costs)
     # return np.mean(costs) / self.mini_batch_size 
     # print "  Mean batch cost: %0.3f" % np.mean(costs)
     # compute changes by -original + final 
@@ -534,7 +545,8 @@ class DistLearner(object):
                approx_local_change = False, # if approx then compare first mini-batch vs. last mini-batch 
                newton_method = 'memoryless-bfgs', # options = 'memoryless-bfgs', 'memoryless-bfgs-avg', 'svd', None
                gradient_average = 'mean', # 'mean', 'best', 'weighted'
-               weight_average = 'mean'): # 'mean', 'best', 'weighted'
+               weight_average = 'mean', # 'mean', 'best', 'weighted' 
+               global_decay = 0.999): 
     self.n_workers = n_workers
     self.n_epochs = n_epochs
     self.n_filters = n_filters 
@@ -548,7 +560,7 @@ class DistLearner(object):
     self.newton_method = newton_method 
     self.gradient_average = gradient_average 
     self.weight_average = weight_average 
-
+    self.global_decay = global_decay 
     self.nets = [Network(mini_batch_size = mini_batch_size, 
                     learning_rate = local_learning_rate, 
                     momentum = local_momentum, 
@@ -597,11 +609,17 @@ class DistLearner(object):
       last_print_idx = 0
       last_print_time = time.time()
       while ntrain - start_idx >= worker_batch_size * self.n_workers: 
+          
+          validation_start = np.random.randint(0, ntrain - self.mini_batch_size)
+          validation_stop = validation_start + self.mini_batch_size
+          val_x = train_set_x[validation_start:validation_stop]
+          val_y = train_set_y[validation_start:validation_stop]
+          
           ws = []
           gs = []
           ss = []
           ys = []
-          
+          costs = []
           for worker_idx  in xrange(self.n_workers):
               # batch_start = start_idx + worker_idx * worker_batch_size
               if worker_idx == 0:
@@ -614,15 +632,14 @@ class DistLearner(object):
               batch_y = train_set_y[batch_start:batch_stop]
               net = self.nets[worker_idx]
               if self.newton_method is not None:
-                # make sure gradients from each worker are on the same data
-                grad_start = np.random.randint(0, ntrain-self.mini_batch_size)
-                grad_stop = grad_start + self.mini_batch_size 
-                grad_set_x = train_set_x[grad_start:grad_stop]
-                grad_set_y = train_set_y[grad_start:grad_stop]
+                grad_set_x = batch_x[-self.mini_batch_size:] 
+                grad_set_y = batch_y[-self.mini_batch_size:]
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
-              net.update_batches(batch_x, batch_y)
+              g_list = net.update_batches(batch_x, batch_y)
               if not simple_backprop:
-                w, g = net.get_state(grad_set_x, grad_set_y)
+                costs.append(net.cost_fn(val_x, val_y))
+                g = net.flatten(g_list)
+                w = net.get_weights()
                 ws.append(w)
                 gs.append(g)
                 if self.newton_method is not None:
@@ -633,35 +650,52 @@ class DistLearner(object):
           if start_idx - last_print_idx >= print_frequency:
             curr_t = time.time()
             print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
+            if len(costs) > 0:
+              print "  -- worker costs", [float(c) for c in costs]
             last_print_time = curr_t 
             last_print_idx = start_idx 
           # start_idx += worker_batch_size * self.n_workers  # SPLITTING DATA BETWEEN WORKERS SUCKS
           start_idx += worker_batch_size 
           if simple_backprop:
             continue
+
+          centered_costs = np.array(costs) - np.mean(costs)
+          scaled_costs = centered_costs / np.std(costs)
+          # a low cost is negative, flip the sign to give it a large weight
+          weights = np.exp(-scaled_costs)
+          weights /= np.sum(weights) 
+          
           if self.gradient_average == 'mean':
             g = mean(gs)
+          elif self.gradient_average == 'best':
+            g = gs[np.argmin(costs)]
+          elif self.gradient_average == 'weighted':
+            g = weighted_mean(gs, weights)
           else:
             assert False, "Not implemented: gradient_average = %s" % self.gradient_average 
+
           if self.weight_average == 'mean':
             w = mean(ws)
+          elif self.weight_average == 'best':
+            w = ws[np.argmin(costs)]
+          elif self.weight_average == 'weighted':
+            w = weighted_mean(ws, weights)
           else:
             assert False, "Not implemented: weight_average = %s" % self.weight_average 
- 
+            
+          # any extra gradient scaling to factor into the learning update 
+          rescale_gradient = 1.0 
           if self.newton_method == 'memoryless-bfgs':
               #print "  Starting BFGS"
               #print "  -- gradient type", type(g)
               #print "  -- gradient shape", g.shape
               rhos = []
               alphas = []
+              #norm_before = norm(g) #np.sqrt(dot(g,g))
               for (s,y) in zip(ss,ys):
-                  assert s.shape == g.shape, s.shape
-                  assert y.shape == g.shape, y.shape
                   rho = 1.0 / dot(s,y)
-                  assert np.isscalar(rho)
                   rhos.append(rho)
                   alpha = rho * dot(s,g) 
-                  assert np.isscalar(alpha)
                   alphas.append(alpha)
                   g = g.mul_add(1.0, y, -alpha)
               for i in reversed(range(self.n_workers)):
@@ -670,8 +704,13 @@ class DistLearner(object):
                   alpha = alphas[i]
                   rho = rhos[i]
                   beta = rho * dot(y,g)
-                  assert np.isscalar(beta)
                   g = g.mul_add(1.0, s, alpha-beta)
+
+              # until we have a line search, 
+              # should normalize the search direction 
+              # since it can grow several orders of magnitude 
+              #norm_after = norm(g) #np.sqrt(dot(g,g))
+              #rescale_gradient = norm_before / norm_after 
           elif self.newton_method == 'svd':
               
               """
@@ -773,9 +812,25 @@ class DistLearner(object):
               print 
           else:
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
-          #eta = w.dtype.type(self.global_learning_rate)
-          #w = numexpr.evaluate('w - eta * g')
-          w  = w.mul_add(1.0, g, -self.global_learning_rate)
+          if self.global_learning_rate == 'search':
+          
+            etas = 10.0 ** np.arange(2, -5, -1) 
+            ws = []
+            w_best = None
+            cost_best = np.inf
+            # print norm(g) 
+            for eta in etas:
+              w_candidate = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
+              self.nets[0].set_weights(w_candidate)
+              cost = self.nets[0].cost_fn(val_x, val_y)
+              # print "   %0.6f ==> %0.6f" % (eta, cost)
+              if cost < cost_best:
+                cost_best = cost
+                w_best = w_candidate
+            w = w_best 
+          else:
+            eta = self.global_learning_rate
+            w  = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
     end_time = time.clock()
@@ -814,19 +869,18 @@ def all_combinations(**params):
 
 from collections import namedtuple 
 if __name__ == '__main__':
-  global_learning_rates = [0.1, 1.0, 2.5]
 
   param_combos = all_combinations(
-       n_workers = [2,1],
+       n_workers = [4,1], 
        mini_batch_size = [64], 
-       n_local_steps = [ 2, 10],  
-       global_learning_rate = global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.1, 0.01], #, 0.001], # TODO: 'random'
+       n_local_steps = [ 20, 5],  
+       global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
+       local_learning_rate = [0.1, 0.01, 0.001], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
-       weight_average = ['mean'], # TODO: weighted, best
-       gradient_average = ['mean'], # TODO: weighted, best 
-       newton_method = ['memoryless-bfgs', None, 'svd', ])
+       weight_average = ['best', 'weighted'], # TODO: weighted, best
+       gradient_average = ['best', 'weighted'], # TODO: weighted, best 
+       newton_method = ['svd', None, 'memoryless-bfgs' ])
 
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
@@ -853,9 +907,13 @@ if __name__ == '__main__':
       print "====="
       print  
   
+  simple_sgd_ran = True
   for (i, params) in enumerate(param_combos):
-    if params['n_workers'] == 1 and params['newton_method'] is None and params['global_learning_rate'] != np.min(global_learning_rates):
-      continue
+    if params['n_workers'] == 1 and params['newton_method'] is None:
+      if simple_sgd_ran:
+        continue
+      else:
+        simple_sgd_ran = True 
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
     print "Param #%d" % (i+1), param_str 
     model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
