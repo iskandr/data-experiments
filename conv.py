@@ -492,8 +492,7 @@ class Network(object):
       yslice = y[start:stop]
       g_flat = self.get_gradients(xslice, yslice)
       if combined is None:
-        combined = g_flat
-        combined *= w  
+        combined = g_flat * w
       else:
         combined = combined.mul_add(1.0, g_flat, w)
     return combined 
@@ -501,20 +500,22 @@ class Network(object):
   def get_state(self, x, y):
     return self.get_weights(), self.average_gradients(x,y)
        
-  def update_batches(self, x, y):
+  def update_batches(self, x, y, average=False):
     """
     Returns list containing most recent gradients
     """
     #costs = [] 
-    gs = [None]
+    gs = []
     def fn(xslice, yslice):
       g_list = self.bprop_update(xslice, yslice)
-      gs[0] = g_list
+      if average:
+        gs.append(self.flatten(g_list))
       # new_dxs = self.local_update_step(grads, dxs)
       #del dxs[0:len(dxs)]
       #dxs.extend(new_dxs)
     for_each_slice(x, y, fn, self.mini_batch_size)
-    return gs[0]
+    if average:
+      return mean(gs)
     #return np.mean(costs)
     # return np.mean(costs) / self.mini_batch_size 
     # print "  Mean batch cost: %0.3f" % np.mean(costs)
@@ -637,17 +638,21 @@ class DistLearner(object):
               if self.newton_method is not None:
                 grad_set_x = batch_x[-self.mini_batch_size:] 
                 grad_set_y = batch_y[-self.mini_batch_size:]
+                #grad_set_x = batch_x 
+                #grad_set_y = batch_y
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
-              g_list = net.update_batches(batch_x, batch_y)
+              if simple_backprop:
+                net.update_batches(batch_x, batch_y, average=False)
+              else:
+                g_path_avg = net.update_batches(batch_x, batch_y, average=True)
               if not simple_backprop:
                 costs.append(net.cost_fn(val_x, val_y))
-                g = net.flatten(g_list)
-                w = net.get_weights()
-                ws.append(w)
-                gs.append(g)
+                gs.append(g_path_avg)
+                last_w, last_g = net.get_state(grad_set_x, grad_set_y)
+                ws.append(last_w)
                 if self.newton_method is not None:
-                  s = w.mul_add(1.0, old_w, -1.0)
-                  y = w.mul_add(1.0, old_g, -1.0)
+                  s = last_w.mul_add(1.0, old_w, -1.0)
+                  y = last_g.mul_add(1.0, old_g, -1.0)
                   ss.append(s)
                   ys.append(y)
           if start_idx - last_print_idx >= print_frequency:
