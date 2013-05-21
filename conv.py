@@ -58,7 +58,7 @@ rng = numpy.random.RandomState(23455)
 class ConvPoolLayer(object):
     """Pool Layer of a convolutional network """
 
-    def __init__(self, rng, input, filter_shape, image_shape, poolsize=(2, 2)):
+    def __init__(self, rng, input, filter_shape, image_shape, poolsize=(2, 2), activation='relu'):
         """
         :type rng: numpy.random.RandomState
         :param rng: a random number generator used to initialize weights
@@ -111,7 +111,11 @@ class ConvPoolLayer(object):
         # reshape it to a tensor of shape (1,n_filters,1,1). Each bias will
         # thus be broadcasted across mini-batches and feature map
         # width & height
-        self.output = T.tanh(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        if activation == 'tanh':
+          self.output = T.tanh(pooled_out + self.b.dimshuffle('x', 0, 'x', 'x'))
+        else:
+          assert activation == 'relu'
+          self.output = T.maximum(0, pooled_out + self.b.dimshuffle('x', 0, 'x', 'x')) 
 
         # store parameters of this layer
         self.params = [self.W, self.b]
@@ -277,6 +281,78 @@ def take_cols(X, k):
   else:
     return X[:, :k]
   
+class ParamsList(object):
+  def __init__(self, xs = None):
+    if xs is None:
+      self.xs = None
+      self.n_updates = 0
+    else:
+      self.xs = self._copy_params(xs) 
+      self.n_updates = 1
+
+  def _copy_param(self, x):
+      if isinstance(x, theano.sandbox.cuda.CudaNdarray):
+        return to_gpuarray(x, copyif=True)
+      elif hasattr(x, 'copy'):
+        return x.copy()
+      else:
+        return x
+
+  def _copy_params(self, xs):
+      return [self._copy_param(xi) for xi in xs]
+
+  def iadd(self, ys):
+    self.n_updates += 1
+
+    if self.xs is None:
+      self.xs = self._copy_params(ys)
+    else:
+      assert len(self.xs) == len(ys)
+      for i, yi in enumerate(ys):
+        # these are bizarrely faster
+        if hasattr(self.xs[i], 'mul_add'):
+           if not isinstance(yi, GPUArray):
+             yi = to_gpuarray(yi, copyif=True)
+           self.xs[i].mul_add(1.0, yi, 1.0)
+        else:
+           self.xs[i] += yi
+  
+  def flatten(self):
+    assert self.xs is not None 
+    elts_per_subarray = []
+    is_array = []
+    elt_type = None
+    gpu_arrays = [] 
+    for w in self.xs:
+      if isinstance(w, theano.sandbox.cuda.CudaNdarray):
+        w = to_gpuarray(w, copyif=True)
+      if isinstance(w, (np.ndarray, GPUArray)):
+        if not hasattr(w, 'gpudata'):
+          w = pycuda.gpuarray.to_gpu(w)
+        elts_per_subarray.append(w.size)
+        is_array.append(True)
+        if elt_type is None:
+          elt_type = w.dtype 
+      else:
+        assert np.isscalar(w)
+        elts_per_subarray.append(1)
+        is_array.append(False)
+      gpu_arrays.append(w) 
+    total_elts = sum(elts_per_subarray)
+    result = pycuda.gpuarray.empty((total_elts,), dtype = elt_type)  
+    curr_idx = 0
+    for (nelts, w) in zip(elts_per_subarray, gpu_arrays):
+      if not np.isscalar(w):
+        w = w.ravel()
+      result_slice = result[curr_idx:(curr_idx + nelts)]
+      if isinstance(w, GPUArray):
+        pycuda.driver.memcpy_dtod(result_slice.gpudata, w.gpudata, w.nbytes)
+      else:
+        result_slice.set(w)
+      curr_idx += nelts
+    assert curr_idx == total_elts  
+    return result
+  
 
 class Network(object): 
   def __init__(self,  
@@ -288,7 +364,8 @@ class Network(object):
                      n_hidden = 300, # originally 500  
                      input_height = 32, 
                      input_width = 32, 
-                     n_colors = 3):
+                     n_colors = 3, 
+                     conv_activation = 'relu'):
    
     self.mini_batch_size = mini_batch_size  
     self.momentum = momentum 
@@ -317,7 +394,7 @@ class Network(object):
     layer0 = ConvPoolLayer(rng, input=layer0_input,
             image_shape=(mini_batch_size, n_colors, input_height, input_width),
             filter_shape=(n_filters[0], n_colors, filter_size[0], filter_size[1]), 
-            poolsize=pool_size)
+            poolsize=pool_size, activation = conv_activation)
 
     # Construct the second convolutional pooling layer
     # filtering reduces the image size to (12-5+1,12-5+1)=(8,8)
@@ -326,7 +403,7 @@ class Network(object):
     layer1 = ConvPoolLayer(rng, input=layer0.output,
             image_shape=(mini_batch_size, n_filters[0], 14, 14),
             filter_shape=(n_filters[1], n_filters[0], filter_size[0], filter_size[1]), 
-            poolsize=pool_size)
+            poolsize=pool_size, activation = conv_activation)
 
     # the TanhLayer being fully-connected, it operates on 2D matrices of
     # shape (batch_size,num_pixels) (i.e matrix of rasterized images).
@@ -371,43 +448,7 @@ class Network(object):
     return [p.get_value(borrow=True) for p in self.params]
 
   def get_weights(self):
-    weights_list = self.get_weights_list()
-    return self.flatten(self.get_weights_list())
-
-  def flatten(self,arrays): 
-    elts_per_subarray = []
-    is_array = []
-    elt_type = None
-    gpu_arrays = [] 
-    for w in arrays:
-      if isinstance(w, theano.sandbox.cuda.CudaNdarray):
-        w = to_gpuarray(w, copyif=True)
-      if isinstance(w, (np.ndarray, GPUArray)):
-        if not hasattr(w, 'gpudata'):
-          w = pycuda.gpuarray.to_gpu(w)
-        elts_per_subarray.append(w.size)
-        is_array.append(True)
-        if elt_type is None:
-          elt_type = w.dtype 
-      else:
-        assert np.isscalar(w)
-        elts_per_subarray.append(1)
-        is_array.append(False)
-      gpu_arrays.append(w) 
-    total_elts = sum(elts_per_subarray)
-    result = pycuda.gpuarray.empty((total_elts,), dtype = elt_type)  
-    curr_idx = 0
-    for (nelts, w) in zip(elts_per_subarray, gpu_arrays):
-      if not np.isscalar(w):
-        w = w.ravel()
-      result_slice = result[curr_idx:(curr_idx + nelts)]
-      if isinstance(w, GPUArray):
-        pycuda.driver.memcpy_dtod(result_slice.gpudata, w.gpudata, w.nbytes)
-      else:
-        result_slice.set(w)
-      curr_idx += nelts
-    assert curr_idx == total_elts  
-    return result
+    return ParamsList(self.get_weights_list()).flatten()
  
   def add_list_to_weights(self, dxs):
     """
@@ -474,7 +515,7 @@ class Network(object):
   def get_gradients(self, xslice, yslice):
     g_list = [to_gpuarray(g_elt, copyif=True)
               for g_elt in self.bprop_grads(xslice, yslice)]
-    return self.flatten(g_list)
+    return ParamsList(g_list).flatten()
 
   def average_gradients(self, x, y):
     """
@@ -504,18 +545,15 @@ class Network(object):
     """
     Returns list containing most recent gradients
     """
-    #costs = [] 
-    gs = []
+    g_avg = ParamsList()
     def fn(xslice, yslice):
       g_list = self.bprop_update(xslice, yslice)
       if average:
-        gs.append(self.flatten(g_list))
-      # new_dxs = self.local_update_step(grads, dxs)
-      #del dxs[0:len(dxs)]
-      #dxs.extend(new_dxs)
+        g_avg.iadd(g_list)
+        del g_list 
     for_each_slice(x, y, fn, self.mini_batch_size)
     if average:
-      return mean(gs)
+      return g_avg.flatten() / g_avg.n_updates
     #return np.mean(costs)
     # return np.mean(costs) / self.mini_batch_size 
     # print "  Mean batch cost: %0.3f" % np.mean(costs)
@@ -536,7 +574,7 @@ class DistLearner(object):
                n_workers = 1,
                n_epochs = 20, # how many passes over the data?
                n_out = 10, # how many outputs?  
-               n_filters = [64, 20], # how many convolutions in the first two layers of the network?  
+               n_filters = [64, 25], # how many convolutions in the first two layers of the network?  
                global_learning_rate = 0.1,  # step size for big steps of combined gradients
                local_learning_rate = 0.01,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -547,7 +585,8 @@ class DistLearner(object):
                newton_method = 'memoryless-bfgs', # options = 'memoryless-bfgs', 'memoryless-bfgs-avg', 'svd', None
                gradient_average = 'mean', # 'mean', 'best', 'weighted'
                weight_average = 'mean', # 'mean', 'best', 'weighted' 
-               global_decay = 0.999): 
+               global_decay = 0.999, 
+               conv_activation = 'relu'): 
     self.n_workers = n_workers
     self.n_epochs = n_epochs
     self.n_filters = n_filters 
@@ -566,7 +605,8 @@ class DistLearner(object):
                     learning_rate = local_learning_rate, 
                     momentum = local_momentum, 
                     n_filters = n_filters, 
-                    n_out = n_out)
+                    n_out = n_out, 
+                    conv_activation = conv_activation)
                  for _ in xrange(n_workers)]
 
   def __str__(self):
@@ -599,22 +639,33 @@ class DistLearner(object):
     worker_batch_size = self.mini_batch_size * self.n_local_steps
     simple_backprop = self.n_workers == 1 and self.newton_method is False
     start_time = time.clock()
+    def get_shuffled_set():
+      start_t = time.time()
+      shuffle_indices = np.arange(ntrain)
+      np.random.shuffle(shuffle_indices)
+      x,y= train_set_x.take(shuffle_indices, axis=0), train_set_y.take(shuffle_indices)
+      stop_t = time.time()
+      print "Shuffle time", stop_t - start_t 
+      return x,y
+    # use these to draw validation sets to avoid 
+    # overlap with parallel training sets 
+    shuffled_x, shuffled_y = get_shuffled_set()   
+    
     def get_validation_set():
         validation_start = np.random.randint(0, ntrain - self.mini_batch_size)
         validation_stop = validation_start + self.mini_batch_size
-        val_x = train_set_x[validation_start:validation_stop]
-        val_y = train_set_y[validation_start:validation_stop]
-        return val_x, val_y 
+        val_x = shuffled_x[validation_start:validation_stop]
+        val_y = shuffled_y[validation_start:validation_stop]
+        return val_x, val_y
+
     for epoch in xrange(self.n_epochs):       
-      # print "  epoch", epoch 
       if shuffle:
-        shuffle_indices = np.arange(ntrain)
-        np.random.shuffle(shuffle_indices)
-        train_set_x = train_set_x[shuffle_indices]
-        train_set_y = train_set_y[shuffle_indices]
+        train_set_x, train_set_y = get_shuffled_set()
       start_idx = 0 
       last_print_idx = 0
       last_print_time = time.time()
+      # used for momentum 
+      dw = None
       while ntrain - start_idx >= worker_batch_size * self.n_workers: 
           
           if not simple_backprop:
@@ -638,27 +689,27 @@ class DistLearner(object):
               if self.newton_method is not None:
                 grad_set_x = batch_x[-self.mini_batch_size:] 
                 grad_set_y = batch_y[-self.mini_batch_size:]
-                #grad_set_x = batch_x 
-                #grad_set_y = batch_y
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
               if simple_backprop:
                 net.update_batches(batch_x, batch_y, average=False)
               else:
                 g_path_avg = net.update_batches(batch_x, batch_y, average=True)
-              if not simple_backprop:
-                costs.append(net.cost_fn(val_x, val_y))
                 gs.append(g_path_avg)
+              costs.append(net.cost_fn(val_x, val_y))
+              if self.newton_method is None:
+                ws.append(net.get_weights())
+              else:
                 last_w, last_g = net.get_state(grad_set_x, grad_set_y)
                 ws.append(last_w)
-                if self.newton_method is not None:
-                  s = last_w.mul_add(1.0, old_w, -1.0)
-                  y = last_g.mul_add(1.0, old_g, -1.0)
-                  ss.append(s)
-                  ys.append(y)
+                s = last_w.mul_add(1.0, old_w, -1.0)
+                y = last_g.mul_add(1.0, old_g, -1.0)
+                ss.append(s)
+                ys.append(y)
           if start_idx - last_print_idx >= print_frequency:
             curr_t = time.time()
             #print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
             if len(costs) > 0:
+             
               print "  -- worker costs", [float(c) for c in costs]
             last_print_time = curr_t 
             last_print_idx = start_idx 
@@ -673,25 +724,31 @@ class DistLearner(object):
             # a low cost is negative, flip the sign to give it a large weight
             weights = np.exp(-scaled_costs)
             weights /= np.sum(weights) 
-
+           
+          lowest_cost_idx = np.argmin(costs)
+          if lowest_cost_idx >= len(gs):
+            print "Bad lowest cost idx! %d / %d" % (lowest_cost_idx, len(gs))
+            lowest_cost_idx = 0
           if self.gradient_average == 'mean':
             g = mean(gs)
           elif self.gradient_average == 'best':
-            g = gs[np.argmin(costs)]
+            
+            g = gs[lowest_cost_idx]
           elif self.gradient_average == 'weighted':
             g = weighted_mean(gs, weights)
           else:
             assert False, "Not implemented: gradient_average = %s" % self.gradient_average 
-
+          del gs 
           if self.weight_average == 'mean':
             w = mean(ws)
           elif self.weight_average == 'best':
-            w = ws[np.argmin(costs)]
+            w = ws[lowest_cost_idx]
           elif self.weight_average == 'weighted':
             w = weighted_mean(ws, weights)
           else:
             assert False, "Not implemented: weight_average = %s" % self.weight_average 
-            
+          del ws
+ 
           # any extra gradient scaling to factor into the learning update 
           rescale_gradient = 1.0 
           if self.newton_method == 'memoryless-bfgs':
@@ -764,63 +821,6 @@ class DistLearner(object):
               g = pycuda.gpuarray.to_gpu(g) 
               g = dot(g, S)
               
-          elif self.newton_method == 'svd-gpu':
-              print "  GPU SVD step"
-              total_start = time.time()
-              concat_start = time.time()
-
-              Y = concat(ys) 
-              S = concat(ss)
-
-              concat_stop = time.time()
-              transfer_host_start = time.time()
-              
-              
-              transfer_host_stop = time.time()
-
-              svd_start = time.time()
-              V,D,U = svd(Y) 
-              svd_stop = time.time()
-
-              diag_ratios = D / getidx(D, 0) 
-              cutoff = 0.0001 
-              if vecmin(diag_ratios) < cutoff:
-                k = argmax(diag_ratios < cutoff)
-              else:
-                k = len(D)
-              print "  k =", k 
-              U = take_rows(U, k) # U = U.T[:k, :]
-              D = D[:k]
-              V = take_cols(V, k) # V = V[:k, :]
-              print "  U2 trunc ", U.shape, type(U)
-              print "  V2 trunc", V.shape, type(V)
-              print "  g ", g.shape 
-  
-              Ug = dot(U, g)
-              DinvUg = (1.0 / D) *  Ug
-              VDinvUg = dot(V, DinvUg)
-              g = dot(VDinvUg, S)           
-
-              transfer_gpu_start = time.time()     
-
-              #g = pycuda.gpuarray.to_gpu(g)
-
-              transfer_gpu_stop = time.time()
-
-              total_stop = time.time()
- 
-              total_t = total_stop - total_start
-              svd_t = svd_stop - svd_start
-              concat_t = concat_stop - concat_start
-              transfer_host_t = transfer_host_stop - transfer_host_start
-              transfer_gpu_t = transfer_gpu_stop - transfer_gpu_start
-              print "  SVD Step time: %0.3f" % total_t
-              print "  -- concat: %0.3f" % concat_t 
-              print "  -- memcpy_dtoh: %0.3f" % transfer_host_t
-              print "  -- memcpy_htod: %0.3f" % transfer_gpu_t 
-              print "  -- svd: %0.3f" % svd_t 
-              print "  -- misc compute: %0.3f" % (total_t - svd_t - concat_t - transfer_host_t - transfer_gpu_t)
-              print 
           else:
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
@@ -831,7 +831,9 @@ class DistLearner(object):
             cost_best = np.inf
             # print norm(g) 
             for eta in etas:
+              
               w_candidate = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
+              
               self.nets[0].set_weights(w_candidate)
               cost = self.nets[0].cost_fn(val_x, val_y)
               # print "   %0.6f ==> %0.6f" % (eta, cost)
@@ -842,6 +844,8 @@ class DistLearner(object):
           else:
             eta = self.global_learning_rate
             w  = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
+          
+              
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
     end_time = time.clock()
@@ -882,16 +886,18 @@ from collections import namedtuple
 if __name__ == '__main__':
 
   param_combos = all_combinations(
-       n_workers = [4,1], 
-       mini_batch_size = [128, 64], 
-       n_local_steps = [ 40, 20, 5 ],  
-       global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.1, 0.01], # TODO: 'random'
+       n_workers = [2], 
+       mini_batch_size = [64], 
+       n_local_steps = [ 10 ],  
+       global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
+       local_learning_rate = [0.1], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
-       weight_average = ['best'], 
-       gradient_average = ['best'],  
-       newton_method = ['svd', None, 'memoryless-bfgs' ])
+       weight_average = ['best',], 
+       gradient_average = ['best', 'weighted'],  
+       newton_method = [None, 'svd', 'memoryless-bfgs' ], 
+       conv_activation = ['relu', 'tanh'],
+  ) 
 
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
@@ -904,7 +910,7 @@ if __name__ == '__main__':
   best_acc_param = None
   best_acc_model = None 
   best_acc_time = None 
-
+  results = {}
   accs = []
 
   def print_best(i):
@@ -932,7 +938,8 @@ if __name__ == '__main__':
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
     accs.append(acc)
-    
+    results[param_str] = acc 
+
     baseline = 1.0 / n_out 
     acc_rate = (acc - baseline) / elapsed_time 
     print "  Elapsed time: %0.3f seconds" % elapsed_time
@@ -952,3 +959,14 @@ if __name__ == '__main__':
   print "DONE!" 
   print 
   print_best(i)
+  results_file_name = 'results'
+  f = open(results_file_name, 'w')
+  import pickle
+  pickle.dump(results, f)
+  f.close()
+  keys = results.keys()
+  values = results.values()
+  sorted_indices = sorted(range(len(results)), key = lambda i: results.values()[i])
+  for idx in sorted_indices:
+    print "%0.3f %s" %   (values[i], keys[i])
+
