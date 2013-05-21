@@ -605,7 +605,7 @@ class DistLearner(object):
         val_y = train_set_y[validation_start:validation_stop]
         return val_x, val_y 
     for epoch in xrange(self.n_epochs):       
-      print "  epoch", epoch 
+      # print "  epoch", epoch 
       if shuffle:
         shuffle_indices = np.arange(ntrain)
         np.random.shuffle(shuffle_indices)
@@ -652,7 +652,7 @@ class DistLearner(object):
                   ys.append(y)
           if start_idx - last_print_idx >= print_frequency:
             curr_t = time.time()
-            print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
+            #print "  Sample %d / %d, elapsed_time %0.3f" % (start_idx, ntrain, curr_t - last_print_time)
             if len(costs) > 0:
               print "  -- worker costs", [float(c) for c in costs]
             last_print_time = curr_t 
@@ -878,8 +878,8 @@ if __name__ == '__main__':
 
   param_combos = all_combinations(
        n_workers = [4,1], 
-       mini_batch_size = [256, 64], 
-       n_local_steps = [ 50, 20, 5 ],  
+       mini_batch_size = [128, 64], 
+       n_local_steps = [ 40, 20, 5 ],  
        global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
        local_learning_rate = [0.1, 0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
@@ -894,7 +894,7 @@ if __name__ == '__main__':
   print "Train set:", train_set_x.shape
   print "Test set:", test_set_x.shape
   n_out = len(np.unique(test_set_y))
-  n_epochs = 20
+  n_epochs = 10
   best_acc = 0 
   best_acc_param = None
   best_acc_model = None 
