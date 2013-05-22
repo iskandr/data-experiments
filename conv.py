@@ -42,7 +42,8 @@ from mlp import HiddenLayer
 from cifar import load_data
 import numexpr 
 import pycuda 
-import pycuda.autoinit 
+import pycuda.autoinit
+import pycuda.curandom 
 from pycuda.gpuarray import GPUArray 
 
 import scikits.cuda 
@@ -91,12 +92,14 @@ class ConvPoolLayer(object):
                    numpy.prod(poolsize))
         # initialize weights with random weights
         W_bound = numpy.sqrt(6. / (fan_in + fan_out))
-        self.W = theano.shared(numpy.asarray(
-            rng.uniform(low=-W_bound, high=W_bound, size=filter_shape),
-            dtype=theano.config.floatX), borrow=True)
+        float_t = getattr(np, theano.config.floatX)
+        W_init = to_cudandarray(pycuda.curandom.rand(shape=filter_shape, dtype=float_t))
+        W_init *= (2*W_bound)
+        W_init -= W_bound 
+        self.W = theano.shared(W_init, borrow=True)
 
         # the bias is a 1D tensor -- one bias per output feature map
-        b_values = numpy.zeros((filter_shape[0],), dtype=theano.config.floatX)
+        b_values = to_cudandarray(pycuda.gpuarray.zeros( shape = (filter_shape[0],), dtype=float_t))
         self.b = theano.shared(value=b_values, borrow=True)
 
         # convolve input feature maps with filters
@@ -282,12 +285,13 @@ def take_cols(X, k):
     return X[:, :k]
   
 class ParamsList(object):
-  def __init__(self, xs = None):
+  def __init__(self, xs = None, copy_first=True):
+    self.copy_first = copy_first 
     if xs is None:
       self.xs = None
       self.n_updates = 0
     else:
-      self.xs = self._copy_params(xs) 
+      self.xs = self._copy_params(xs) if copy_first else xs 
       self.n_updates = 1
 
   def _copy_param(self, x):
@@ -305,7 +309,7 @@ class ParamsList(object):
     self.n_updates += 1
 
     if self.xs is None:
-      self.xs = self._copy_params(ys)
+      self.xs = self._copy_params(ys) if self.copy_first else ys
     else:
       assert len(self.xs) == len(ys)
       for i, yi in enumerate(ys):
@@ -361,7 +365,7 @@ class Network(object):
                      momentum, 
                      n_filters, 
                      n_out = 10,
-                     n_hidden = 300, # originally 500  
+                     n_hidden = [200, 100, 50, 25, 15], 
                      input_height = 32, 
                      input_width = 32, 
                      n_colors = 3, 
@@ -383,51 +387,61 @@ class Network(object):
 
     # Reshape matrix of rasterized images 
     # to a 4D tensor, compatible with our LeNetConvPoolLayer
-    layer0_input = x.reshape((mini_batch_size, n_colors, input_height, input_width))
-
+    conv0_input = x.reshape((mini_batch_size, n_colors, input_height, input_width))
     # Construct the first convolutional pooling layer:
     # filtering reduces the image size to (28-5+1,28-5+1)=(24,24)
     # maxpooling reduces this further to (24/2,24/2) = (12,12)
     # 4D output tensor is thus of shape (batch_size,nkerns[0],12,12)
     pool_size = (2,2)
     filter_size = (5,5) 
-    layer0 = ConvPoolLayer(rng, input=layer0_input,
+    conv0 = ConvPoolLayer(rng, input=conv0_input,
             image_shape=(mini_batch_size, n_colors, input_height, input_width),
             filter_shape=(n_filters[0], n_colors, filter_size[0], filter_size[1]), 
             poolsize=pool_size, activation = conv_activation)
-
     # Construct the second convolutional pooling layer
     # filtering reduces the image size to (12-5+1,12-5+1)=(8,8)
     # maxpooling reduces this further to (8/2,8/2) = (4,4)
     # 4D output tensor is thus of shape (nkerns[0],nkerns[1],4,4)
-    layer1 = ConvPoolLayer(rng, input=layer0.output,
+    conv1 = ConvPoolLayer(rng, input=conv0.output,
             image_shape=(mini_batch_size, n_filters[0], 14, 14),
             filter_shape=(n_filters[1], n_filters[0], filter_size[0], filter_size[1]), 
             poolsize=pool_size, activation = conv_activation)
-
     # the TanhLayer being fully-connected, it operates on 2D matrices of
     # shape (batch_size,num_pixels) (i.e matrix of rasterized images).
     # This will generate a matrix of shape (20,32*4*4) = (20,512)
-    layer2_input = layer1.output.flatten(2)
-
-    # construct a fully-connected sigmoidal layer
-    layer2 = \
-      HiddenLayer(rng, input=layer2_input, n_in=n_filters[1] * filter_size[0] * filter_size[1],
-                  n_out=n_hidden, activation=T.tanh)
+    
+    if isinstance(n_hidden, int):
+      n_hidden = [n_hidden]
+    
+    hidden_layers = []
+    last_output = conv1.output.flatten(2)
+    last_output_size = n_filters[1] * filter_size[0] * filter_size[1]
+    for n in n_hidden:
+      # construct a fully-connected sigmoidal layer
+      layer = HiddenLayer(rng, 
+                  input=last_output, 
+                  n_in=last_output_size,
+                  n_out=n, activation=T.tanh)
+      last_output = layer.output
+      last_output_size = n
+      hidden_layers.append(layer)
 
     # classify the values of the fully-connected sigmoidal layer
-    layer3 = LogisticRegression(input=layer2.output, n_in=n_hidden, n_out=n_out)
+    output_layer = LogisticRegression(
+                     input=last_output, 
+                     n_in=last_output_size, 
+                    n_out=n_out)
 
     # the cost we minimize during training is the NLL of the model
-    self.cost = layer3.negative_log_likelihood(y)
-
+    self.cost = output_layer.negative_log_likelihood(y)
     # create a function to compute the mistakes that are made by the model
-    self.test_model = theano.function([x,y], layer3.errors(y)) 
-    self.params = layer3.params + layer2.params + layer1.params + layer0.params
-    
+    self.test_model = theano.function([x,y], output_layer.errors(y)) 
+    self.params = output_layer.params + conv1.params + conv0.params
+    for layer in hidden_layers:
+      self.params.extend(layer.params)
+
     # create a list of gradients for all model parameters
     self.grads = T.grad(self.cost, self.params)
-
     # train_model is a function that updates the model parameters by
     # SGD Since this model has many parameters, it would be tedious to
     # manually create an update rule for each model parameter. We thus
@@ -436,13 +450,12 @@ class Network(object):
     updates = []
     for param_i, grad_i in zip(self.params, self.grads):
         updates.append((param_i, param_i - learning_rate * grad_i))
-
-    # self.train_model = theano.function([x,y], self.cost)# , updates=updates)
-    # self.fprop = theano.function([x,y], self.cost)
-    self.bprop_grads = theano.function([x, y], self.grads)
-
-    self.bprop_update = theano.function([x, y], self.grads, updates = updates) 
-    self.cost_fn = theano.function([x, y], self.cost)
+    # WARNING: We are going to overwrite the gradients!
+    borrowed_grads = [theano.Out(g, borrow=True) for g in self.grads ]
+    self.bprop_return_grads = theano.function([x, y], borrowed_grads)
+    self.bprop_update_return_grads = theano.function([x, y], borrowed_grads, updates = updates) 
+    self.bprop_update_return_cost = theano.function([x, y], self.cost, updates = updates) 
+    self.return_cost = theano.function([x, y], self.cost)
 
   def get_weights_list(self):
     return [p.get_value(borrow=True) for p in self.params]
@@ -465,7 +478,7 @@ class Network(object):
    """
    curr_idx = 0
    for p in self.params:
-     w = p.get_value(borrow=True)
+     w = p.get_value(borrow=True, return_internal_type=True)
      if isinstance(w, (GPUArray, np.ndarray)):
        nelts = w.size
        w_flat = w.ravel()
@@ -482,7 +495,7 @@ class Network(object):
   def set_weights(self, new_w):
     curr_idx = 0
     for p in self.params:
-      w = p.get_value(borrow=True)
+      w = p.get_value(borrow=True, return_internal_type=True)
       if isinstance(new_w, GPUArray):
         nelts = w.size 
         new_reshaped = new_w[curr_idx:curr_idx+nelts].reshape(w.shape)
@@ -493,7 +506,7 @@ class Network(object):
       elif isinstance(new_w, np.ndarray):
         nelts = w.size
         new_reshaped = np.reshape(new_w[curr_idx:curr_idx+nelts], w.shape) 
-        p.set_value(new_reshaped)
+        p.set_value(pycuda.gpuarray.to_gpu(new_reshaped))
       else:
         assert np.isscalar(w)
         nelts = 1 
@@ -512,10 +525,12 @@ class Network(object):
     self.add_list_to_weights(new_dxs)
     return new_dxs 
 
+  def get_gradients_list(self, xslice, yslice):
+    return [to_gpuarray(g_elt, copyif=True)
+            for g_elt in self.bprop_return_grads(xslice, yslice)]
+
   def get_gradients(self, xslice, yslice):
-    g_list = [to_gpuarray(g_elt, copyif=True)
-              for g_elt in self.bprop_grads(xslice, yslice)]
-    return ParamsList(g_list).flatten()
+    return ParamsList(self.get_gradients_list(xslice, yslice), copy_first=False).flatten()
 
   def average_gradients(self, x, y):
     """
@@ -524,20 +539,18 @@ class Network(object):
     n_batches = x.shape[0] / self.mini_batch_size
     if n_batches == 1:
       return self.get_gradients(x,y)
-    w = 1.0 / n_batches 
-    combined = None 
+    combined = ParamsList(copy_first=False)
     for batch_idx in xrange(n_batches):
       start = batch_idx*self.mini_batch_size
       stop = start + self.mini_batch_size
       xslice = x[start:stop]
       yslice = y[start:stop]
-      g_flat = self.get_gradients(xslice, yslice)
-      if combined is None:
-        combined = g_flat * w
-      else:
-        combined = combined.mul_add(1.0, g_flat, w)
-    return combined 
-  
+      gs = self.get_gradient_list(xslice, yslice)
+      combined.iadd(gs)
+    g = combined.flatten() 
+    g *= (1.0 / combined.n_updates)
+    return g 
+ 
   def get_state(self, x, y):
     return self.get_weights(), self.average_gradients(x,y)
        
@@ -545,20 +558,20 @@ class Network(object):
     """
     Returns list containing most recent gradients
     """
-    g_avg = ParamsList()
+    g_sum = ParamsList(copy_first=False)
     def fn(xslice, yslice):
-      g_list = self.bprop_update(xslice, yslice)
+        
       if average:
-        g_avg.iadd(g_list)
+        g_list = self.bprop_update_return_grads(xslice, yslice)
+        g_sum.iadd(g_list)
         del g_list 
+      else:
+        self.bprop_update_return_cost(xslice, yslice)
     for_each_slice(x, y, fn, self.mini_batch_size)
     if average:
-      return g_avg.flatten() / g_avg.n_updates
-    #return np.mean(costs)
-    # return np.mean(costs) / self.mini_batch_size 
-    # print "  Mean batch cost: %0.3f" % np.mean(costs)
-    # compute changes by -original + final 
-    #return final_weights, final_grads, initial_weights, initial_grads 
+      g = g_sum.flatten() 
+      g *= (1.0 / g_sum.n_updates)
+      return g 
 
  
 def for_each_slice(x, y, fn, mini_batch_size):
@@ -573,10 +586,12 @@ class DistLearner(object):
   def __init__(self, 
                n_workers = 1,
                n_epochs = 20, # how many passes over the data?
+               pretrain_epochs = 0, # how many pure SGD passes?
+               posttrain_epochs = 2,  # how many cleanup SGD passes?  
                n_out = 10, # how many outputs?  
-               n_filters = [64, 32], # how many convolutions in the first two layers of the network?  
-               global_learning_rate = 0.1,  # step size for big steps of combined gradients
-               local_learning_rate = 0.01,  # step size on each worker
+               n_filters = [64, 64], # how many convolutions in the first two layers of the network?  
+               global_learning_rate = 'search',  # step size for big steps of combined gradients
+               local_learning_rate = 0.1,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
                local_momentum = 0.05,   # momentum on each worker 
                mini_batch_size = 20,    # how many gradients does a worker average per local step?
@@ -589,6 +604,8 @@ class DistLearner(object):
                conv_activation = 'relu'): 
     self.n_workers = n_workers
     self.n_epochs = n_epochs
+    self.pretrain_epochs = pretrain_epochs
+    self.posttrain_epochs = posttrain_epochs 
     self.n_filters = n_filters 
     self.global_learning_rate = global_learning_rate 
     self.local_learning_rate = local_learning_rate 
@@ -607,7 +624,8 @@ class DistLearner(object):
                     n_filters = n_filters, 
                     n_out = n_out, 
                     conv_activation = conv_activation)
-                 for _ in xrange(n_workers)]
+                 for _ in xrange(self.n_workers)]
+    
 
   def __str__(self):
     attrs = ["%s = %s" % (k,self.__dict__[k]) for k in self.sorted_keys()]
@@ -637,7 +655,6 @@ class DistLearner(object):
     ntrain, ncolors, image_rows, image_cols = train_set_x.shape
     # compute number of minibatches for training, validation and testing
     worker_batch_size = self.mini_batch_size * self.n_local_steps
-    simple_backprop = self.n_workers == 1 and self.newton_method is False
     start_time = time.clock()
     def get_shuffled_set():
       shuffle_indices = np.arange(ntrain)
@@ -657,17 +674,27 @@ class DistLearner(object):
         val_x = shuffled_x[validation_start:validation_stop]
         val_y = shuffled_y[validation_start:validation_stop]
         return val_x, val_y
+
+    # first run some pure SGD epochs on a single worker 
+    for epoch in xrange(self.pretrain_epochs):
+      print "Pretraining epoch", epoch 
+      if shuffle: train_set_x, train_set_y = get_shuffled_set()
+      self.nets[0].update_batches(train_set_x, train_set_y)
+      print "  -- validation accuracy = %0.3f" % (self.score(acc_val_x, acc_val_y) * 100)
     
+    if self.pretrain_epochs > 0 and self.n_workers > 1:
+      w = self.nets[0].get_weights()
+      print "Weight vector len = %d" % len(w) 
+      for i in xrange(1, self.n_workers):
+        self.nets[0].set_weights(w)
+     
     for epoch in xrange(self.n_epochs):       
-      if shuffle:
-        train_set_x, train_set_y = get_shuffled_set()
+      if shuffle: train_set_x, train_set_y = get_shuffled_set()
       start_idx = 0 
       # will eventually be used for momentum 
       dw = None
-      while ntrain - start_idx >= worker_batch_size * self.n_workers: 
-          
-          if not simple_backprop:
-            val_x, val_y = get_validation_set()
+      while ntrain - start_idx >= worker_batch_size: 
+          val_x, val_y = get_validation_set()
              
           ws = []
           gs = []
@@ -689,12 +716,9 @@ class DistLearner(object):
                 grad_set_x = batch_x[-self.mini_batch_size:] 
                 grad_set_y = batch_y[-self.mini_batch_size:]
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
-              if simple_backprop:
-                net.update_batches(batch_x, batch_y, average=False)
-              else:
-                g_path_avg = net.update_batches(batch_x, batch_y, average=True)
-                gs.append(g_path_avg)
-              costs.append(net.cost_fn(val_x, val_y))
+              g_path_avg = net.update_batches(batch_x, batch_y, average=True)
+              gs.append(g_path_avg)
+              costs.append(net.return_cost(val_x, val_y))
               if self.newton_method is None:
                 ws.append(net.get_weights())
               else:
@@ -706,9 +730,7 @@ class DistLearner(object):
                 ys.append(y)
           
           start_idx += worker_batch_size 
-          if simple_backprop:
-            continue
-
+ 
           if self.gradient_average == 'weighted' or self.weight_average == 'weighted':
             centered_costs = np.array(costs) - np.mean(costs)
             scaled_costs = centered_costs / np.std(costs)
@@ -723,21 +745,19 @@ class DistLearner(object):
           if self.gradient_average == 'mean':
             g = mean(gs)
           elif self.gradient_average == 'best':
-            
             g = gs[lowest_cost_idx]
-          elif self.gradient_average == 'weighted':
-            g = weighted_mean(gs, weights)
           else:
-            assert False, "Not implemented: gradient_average = %s" % self.gradient_average 
-          del gs 
+            assert self.gradient_average == 'weighted'
+            g = weighted_mean(gs, weights)
+          del gs
+  
           if self.weight_average == 'mean':
             w = mean(ws)
           elif self.weight_average == 'best':
             w = ws[lowest_cost_idx]
-          elif self.weight_average == 'weighted':
-            w = weighted_mean(ws, weights)
           else:
-            assert False, "Not implemented: weight_average = %s" % self.weight_average 
+            assert self.weight_average == 'weighted'
+            w = weighted_mean(ws, weights)
           del ws
  
           # any extra gradient scaling to factor into the learning update 
@@ -768,7 +788,7 @@ class DistLearner(object):
               # should normalize the search direction 
               # since it can grow several orders of magnitude 
               if self.global_learning_rate != 'search':
-                norm_after = norm(g) #np.sqrt(dot(g,g))
+                norm_after = norm(g) 
                 rescale_gradient = norm_before / norm_after 
           elif self.newton_method == 'svd':
               
@@ -816,22 +836,23 @@ class DistLearner(object):
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
             val_x, val_y = get_validation_set()
-            etas = 10.0 ** np.arange(2, -5, -1) 
+            etas = 10.0 ** np.arange(2.5, -5, -0.5) 
             ws = []
             w_best = None
+            eta_best = None
             cost_best = np.inf
-            # print norm(g) 
             for eta in etas:
-              
               w_candidate = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
               
               self.nets[0].set_weights(w_candidate)
-              cost = self.nets[0].cost_fn(val_x, val_y)
+              cost = self.nets[0].return_cost(val_x, val_y)
               # print "   %0.6f ==> %0.6f" % (eta, cost)
               if cost < cost_best:
                 cost_best = cost
                 w_best = w_candidate
-            w = w_best 
+                eta_best = eta 
+            w = w_best
+            print "Best step size", eta_best
           else:
             eta = self.global_learning_rate
             w  = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
@@ -840,6 +861,12 @@ class DistLearner(object):
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
       print "Epoch %d -- validation accuracy = %0.3f" % (epoch, self.score(acc_val_x, acc_val_y) * 100)
+
+    for epoch in xrange(self.posttrain_epochs):
+      print "Posttraining epoch", epoch 
+      train_set_x, train_set_y = get_shuffled_set()
+      self.nets[0].update_batches(train_set_x, train_set_y)
+      print "  -- validation accuracy = %0.3f" % (self.score(acc_val_x, acc_val_y) * 100)
     end_time = time.clock()
     elapsed = end_time - start_time 
     return elapsed 
@@ -878,11 +905,11 @@ from collections import namedtuple
 if __name__ == '__main__':
 
   param_combos = all_combinations(
-       n_workers = [4], 
-       mini_batch_size = [32], 
-       n_local_steps = [ 10 ],  
+       n_workers = [1], 
+       mini_batch_size = [64], 
+       n_local_steps = [ 10,20 ],  
        global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.01], # TODO: 'random'
+       local_learning_rate = [0.01, 0.1], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
        weight_average = ['best',], 
@@ -897,7 +924,6 @@ if __name__ == '__main__':
   print "Train set:", train_set_x.shape
   print "Test set:", test_set_x.shape
   n_out = len(np.unique(test_set_y))
-  n_epochs = 10
   best_acc = 0 
   best_acc_param = None
   best_acc_model = None 
@@ -916,16 +942,10 @@ if __name__ == '__main__':
       print "====="
       print  
   
-  simple_sgd_ran = True
   for (i, params) in enumerate(param_combos):
-    if params['n_workers'] == 1 and params['newton_method'] is None:
-      if simple_sgd_ran:
-        continue
-      else:
-        simple_sgd_ran = True 
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
     print "Param #%d" % (i+1), param_str 
-    model = DistLearner(n_epochs = n_epochs, n_out = n_out, **params)
+    model = DistLearner(n_out = n_out, n_epochs = 10, pretrain_epochs = 0, posttrain_epochs = 5,  **params)
 
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
@@ -944,8 +964,6 @@ if __name__ == '__main__':
       best_acc_model = model 
       best_acc_param = param_str
       best_acc_time = elapsed_time 
-
-    
     print_best(i)
   print
   print "DONE!" 
