@@ -358,18 +358,20 @@ class ParamsList(object):
     return result
   
 
-class Network(object): 
+class ConvNet(object): 
   def __init__(self,  
                      mini_batch_size, 
                      learning_rate, 
                      momentum, 
-                     n_filters, 
-                     n_out = 10,
-                     n_hidden = [200, 100, 50, 25], 
+                     n_out = 10, 
                      input_height = 32, 
                      input_width = 32, 
                      n_colors = 3, 
-                     conv_activation = 'relu'):
+                     filter_size = (5,5),
+                     pool_size = (2,2), 
+                     conv_activation = 'relu',
+                     n_filters = [64, 64], 
+                     n_hidden = [200, 100, 50, 25]): 
    
     self.mini_batch_size = mini_batch_size  
     self.momentum = momentum 
@@ -494,17 +496,15 @@ class Network(object):
 
   def set_weights(self, new_w):
     curr_idx = 0
+    assert isinstance(new_w, (CudaNdarray, GPUArray))
     for p in self.params:
       w = p.get_value(borrow=True, return_internal_type=True)
       nelts = 1 if np.isscalar(w) else w.size 
-      if isinstance(new_w, (CudaNdarray, GPUArray)):
+      if isinstance(w, (CudaNdarray, GPUArray)):
         new_reshaped = new_w[curr_idx:curr_idx+nelts].reshape(w.shape)
         nbytes = new_reshaped.nbytes if hasattr(new_reshaped, 'nbytes') else 4 * nelts 
-        assert hasattr(w, 'gpudata')
         pycuda.driver.memcpy_dtod(w.gpudata, new_reshaped.gpudata, nbytes)
-      elif isinstance(new_w, np.ndarray):
-        new_reshaped = np.reshape(new_w[curr_idx:curr_idx+nelts], w.shape) 
-        p.set_value(pycuda.gpuarray.to_gpu(new_reshaped), borrow=True)
+        # p.set_value(pycuda.gpuarray.to_gpu(new_reshaped), borrow=True)
       else:
         assert np.isscalar(w), "Expected scalar, got %s" % type(w) 
         p.set_value(np.array(new_w[curr_idx:curr_idx+1])[0])
@@ -601,7 +601,7 @@ class DistLearner(object):
                pretrain_epochs = 0, # how many pure SGD passes?
                posttrain_epochs = 10,  # how many cleanup SGD passes?  
                n_out = 10, # how many outputs?  
-               n_filters = [128, 64], # how many convolutions in the first two layers of the network?  
+               n_filters = [64, 96], # how many convolutions in the first two layers of the network?  
                global_learning_rate = 'search',  # step size for big steps of combined gradients
                local_learning_rate = 0.1,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -848,7 +848,7 @@ class DistLearner(object):
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
             val_x, val_y = get_validation_set()
-            etas = 10.0 ** np.arange(2.5, -5, -0.5) 
+            etas = [160, 80, 40, 20, 10, 5, 1, 0.5, .1, .05, .01, .005, 0.001]
             ws = []
             w_best = None
             eta_best = None
@@ -864,7 +864,7 @@ class DistLearner(object):
                 w_best = w_candidate
                 eta_best = eta 
             w = w_best
-            print "  -- best step size", eta_best
+            print "  -- best step size", eta_best, "step norm", (eta*rescale_gradient)*norm(g)
           else:
             eta = self.global_learning_rate
             w  = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
@@ -889,7 +889,7 @@ class DistLearner(object):
     if np.isnan(mean_err) or np.isinf(mean_err):
       return 0
     else:
-      return 1 - np.mean(errs)
+      return 1 - mean_err
 
 def all_combinations(**params):
   combos = [{}]
@@ -908,10 +908,11 @@ def all_combinations(**params):
 
 from collections import namedtuple 
 if __name__ == '__main__':
-
+  n_epochs = 20
+  posttrain_epochs = 5
   param_combos = all_combinations(
        n_workers = [2,1], 
-       mini_batch_size = [64], 
+       mini_batch_size = [64, 128], 
        n_local_steps = [ 20 ],  
        global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
        local_learning_rate = [0.01], # TODO: 'random'
@@ -922,7 +923,6 @@ if __name__ == '__main__':
        newton_method = ['svd', 'memoryless-bfgs', None ], 
        conv_activation = ['relu', 'tanh'],
   ) 
-
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
     load_data(labels='coarse_labels')
@@ -950,7 +950,10 @@ if __name__ == '__main__':
   for (i, params) in enumerate(param_combos):
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
     print "Param #%d" % (i+1), param_str 
-    model = DistLearner(n_out = n_out, n_epochs = 20, pretrain_epochs = 0, posttrain_epochs = 10,  **params)
+    model = DistLearner(n_out = n_out, 
+                       n_epochs = n_epochs, 
+                       pretrain_epochs = 0, 
+                       posttrain_epochs = posttrain_epochs,  **params)
 
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
