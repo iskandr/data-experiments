@@ -103,7 +103,7 @@ class DistConvNet(object):
     for epoch in xrange(self.pretrain_epochs):
       print "Pretraining epoch", epoch 
       if shuffle: train_set_x, train_set_y = get_shuffled_set()
-      self.nets[0].update_batches(train_set_x, train_set_y)
+      self.nets[0].fit(train_set_x, train_set_y)
       print "  -- validation accuracy = %0.3f" % (self.score(acc_val_x, acc_val_y) * 100)
     
     if self.pretrain_epochs > 0 and self.n_workers > 1:
@@ -140,7 +140,7 @@ class DistConvNet(object):
                 grad_set_x = batch_x[-self.mini_batch_size:] 
                 grad_set_y = batch_y[-self.mini_batch_size:]
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
-              g_path_avg = net.update_batches(batch_x, batch_y, average=True)
+              g_path_avg = net.fit(batch_x, batch_y, average=True)
               gs.append(g_path_avg)
               costs.append(net.average_cost(val_x, val_y))
               if self.newton_method is None:
@@ -287,7 +287,7 @@ class DistConvNet(object):
     for epoch in xrange(self.posttrain_epochs):
       print "Posttraining epoch", epoch 
       train_set_x, train_set_y = get_shuffled_set()
-      self.nets[0].update_batches(train_set_x, train_set_y)
+      self.nets[0].fit(train_set_x, train_set_y)
       print "  -- validation accuracy = %0.3f" % (self.score(acc_val_x, acc_val_y) * 100)
     end_time = time.clock()
     elapsed = end_time - start_time 

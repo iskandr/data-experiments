@@ -6,6 +6,8 @@ import numpy
 import numpy as np 
 
 from striate import ConvNet 
+
+from cifar import load_data 
 from dist_conv import DistConvNet 
 
 def all_combinations(**params):
@@ -67,7 +69,7 @@ if __name__ == '__main__':
   for (i, params) in enumerate(param_combos):
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
     print "Param #%d" % (i+1), param_str 
-    model = DistLearner(n_out = n_out, 
+    model = DistConvNet(n_out = n_out, 
                        n_epochs = n_epochs, 
                        pretrain_epochs = 0, 
                        posttrain_epochs = posttrain_epochs,  **params)
