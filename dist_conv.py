@@ -4,7 +4,7 @@ import numpy as np
 import pycuda
 import pycuda.autoinit 
 
-from striate import ConvNet, dot, norm    
+from striate import ConvNet, dot, norm, concat  
 
 class DistConvNet(object):
   def __init__(self, 
@@ -42,10 +42,11 @@ class DistConvNet(object):
     self.gradient_average = gradient_average 
     self.weight_average = weight_average 
     self.global_decay = global_decay 
-    self.nets = [ConvNet(mini_batch_size = mini_batch_size, 
+    self.nets = [ConvNet(batch_size = mini_batch_size, 
                     learning_rate = local_learning_rate, 
                     momentum = local_momentum, 
                     n_filters = n_filters, 
+                    input_size = (32,32),
                     n_out = n_out, 
                     conv_activation = conv_activation)
                  for _ in xrange(self.n_workers)]
@@ -140,7 +141,7 @@ class DistConvNet(object):
                 grad_set_x = batch_x[-self.mini_batch_size:] 
                 grad_set_y = batch_y[-self.mini_batch_size:]
                 old_w, old_g = net.get_state(grad_set_x, grad_set_y)
-              g_path_avg = net.fit(batch_x, batch_y, average=True)
+              g_path_avg = net.fit(batch_x, batch_y, return_average_gradient=True)
               gs.append(g_path_avg)
               costs.append(net.average_cost(val_x, val_y))
               if self.newton_method is None:
@@ -249,18 +250,16 @@ class DistConvNet(object):
               U = U[:k, :]
               V = V[:, :k]
               D = D[:k]
-              
               g = np.dot(U, g)
               g *= (1.0 / D) 
               g = np.dot(V, g)
               g = pycuda.gpuarray.to_gpu(g) 
               g = dot(g, S)
-              
           else:
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
             val_x, val_y = get_validation_set()
-            etas = [160, 80, 40, 20, 10, 5, 1, 0.5, .1, .05, .01, .005, 0.001]
+            etas = [320, 160, 80, 40, 20, 10, 5, 1, 0.5, .1, .05, .01, ]
             ws = []
             w_best = None
             eta_best = None

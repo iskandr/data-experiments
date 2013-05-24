@@ -30,9 +30,9 @@ if __name__ == '__main__':
   n_epochs = 20
   posttrain_epochs = 5
   param_combos = all_combinations(
-       n_workers = [2,1], 
-       mini_batch_size = [64, 128], 
-       n_local_steps = [ 20 ],  
+       n_workers = [1, 4], 
+       mini_batch_size = [64 ], 
+       n_local_steps = [ 10, 20 ],  
        global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
        local_learning_rate = [0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
