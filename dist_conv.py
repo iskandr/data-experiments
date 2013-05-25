@@ -4,7 +4,7 @@ import numpy as np
 import pycuda
 import pycuda.autoinit 
 
-from striate import ConvNet, dot, norm, concat  
+from striate import ConvNet, dot, norm, concat, mean, weighted_mean  
 
 class DistConvNet(object):
   def __init__(self, 
@@ -13,7 +13,8 @@ class DistConvNet(object):
                pretrain_epochs = 0, # how many pure SGD passes?
                posttrain_epochs = 10,  # how many cleanup SGD passes?  
                n_out = 10, # how many outputs?  
-               n_filters = [64, 96], # how many convolutions in the first two layers of the network?  
+               n_filters = [128, 96], # how many convolutions in the first two layers of the network?  
+               filter_size = [7,7], 
                global_learning_rate = 'search',  # step size for big steps of combined gradients
                local_learning_rate = 0.1,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -24,7 +25,7 @@ class DistConvNet(object):
                newton_method = 'memoryless-bfgs', # options = 'memoryless-bfgs', 'memoryless-bfgs-avg', 'svd', None
                gradient_average = 'mean', # 'mean', 'best', 'weighted'
                weight_average = 'mean', # 'mean', 'best', 'weighted' 
-               global_decay = 0.9995, 
+               global_decay = 0.9999, 
                conv_activation = 'relu'): 
     self.n_workers = n_workers
     self.n_epochs = n_epochs
@@ -45,7 +46,8 @@ class DistConvNet(object):
     self.nets = [ConvNet(batch_size = mini_batch_size, 
                     learning_rate = local_learning_rate, 
                     momentum = local_momentum, 
-                    n_filters = n_filters, 
+                    n_filters = n_filters,
+                    filter_size = filter_size,  
                     input_size = (32,32),
                     n_out = n_out, 
                     conv_activation = conv_activation)
@@ -161,8 +163,7 @@ class DistConvNet(object):
             scaled_costs = centered_costs / np.std(costs)
             # a low cost is negative, flip the sign to give it a large weight
             weights = np.exp(-scaled_costs)
-            weights /= np.sum(weights) 
-           
+            weights /= np.sum(weights)
           lowest_cost_idx = np.argmin(costs)
           if lowest_cost_idx >= len(gs):
             print "Bad lowest cost idx! %d / %d" % (lowest_cost_idx, len(gs))
@@ -259,10 +260,10 @@ class DistConvNet(object):
               assert self.newton_method is None, "Unrecognized newton method: %s" % self.newton_method
           if self.global_learning_rate == 'search':
             val_x, val_y = get_validation_set()
-            etas = [320, 160, 80, 40, 20, 10, 5, 1, 0.5, .1, .05, .01, ]
+            etas = [1000,  100, 10, 1, .1, .01, .001]
             ws = []
-            w_best = None
-            eta_best = None
+            w_best = w
+            eta_best = 0 
             cost_best = np.inf
             for eta in etas:
               w_candidate = w.mul_add(self.global_decay, g, -eta * rescale_gradient)

@@ -65,10 +65,15 @@ if __name__ == '__main__':
       print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_param)
       print "====="
       print  
- 
-  for (i, params) in enumerate(param_combos):
+
+  i = 0 
+  for params in param_combos:
+    if (params['weight_average'] == 'weighted' or params['gradient_average'] == 'weighted') and params['n_workers'] == 1:
+      continue 
+    else:
+      i += 1
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
-    print "Param #%d" % (i+1), param_str 
+    print "Param #%d" % i, param_str 
     model = DistConvNet(n_out = n_out, 
                        n_epochs = n_epochs, 
                        pretrain_epochs = 0, 
