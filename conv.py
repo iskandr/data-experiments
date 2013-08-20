@@ -30,9 +30,9 @@ if __name__ == '__main__':
   n_epochs = 20
   posttrain_epochs = 5
   param_combos = all_combinations(
-       n_workers = [2,1], 
-       mini_batch_size = [64, 128], 
-       n_local_steps = [ 20 ],  
+       n_workers = [1, 4], 
+       mini_batch_size = [64 ], 
+       n_local_steps = [ 10, 20 ],  
        global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
        local_learning_rate = [0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
@@ -65,10 +65,15 @@ if __name__ == '__main__':
       print "Best  w/ accuracy %0.3f, training time = %s, model = %s" % (best_acc*100.0, best_acc_time, best_acc_param)
       print "====="
       print  
- 
-  for (i, params) in enumerate(param_combos):
+
+  i = 0 
+  for params in param_combos:
+    if (params['weight_average'] == 'weighted' or params['gradient_average'] == 'weighted') and params['n_workers'] == 1:
+      continue 
+    else:
+      i += 1
     param_str = ", ".join("%s = %s" % (k,params[k]) for k in sorted(params))
-    print "Param #%d" % (i+1), param_str 
+    print "Param #%d" % i, param_str 
     model = DistConvNet(n_out = n_out, 
                        n_epochs = n_epochs, 
                        pretrain_epochs = 0, 
