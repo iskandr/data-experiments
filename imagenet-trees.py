@@ -6,32 +6,38 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.linear_model import SGDClassifier 
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, ExtraTreesClassifier, GradientBoostingClassifier
 import glob 
+import sys 
 import time 
 
 
-DEBUG = True
 
 from PyWiseRF import WiseRF 
 Ensemble = WiseRF
 
 train_files = list(glob.glob('/scratch1/imagenet-pickle/train-data.pickle.*'))
 
+if len(sys.argv) > 1:
+  DEBUG = (sys.argv[1] in ("d", "dbg", "debug"))
+else:
+  DEBUG = False  
+
 if DEBUG:
   k = 2
   n_trees = 1 
-  max_depth = 1
+  max_depth = 2
   train_files = train_files[:1]
-  max_samples_per_file = 100000
+  max_samples_per_file = 10000
 else:
-  k = 2 
+  k = 10
   n_trees = 201
   max_depth = 35
   max_samples_per_file = None
   
-kmeans = MiniBatchKMeans(n_clusters = k)
 
 coarse_classifiers = []
 fine_classifiers = [[] for _ in xrange(k)] 
+
+kmeans = MiniBatchKMeans(n_clusters = k, batch_size = 1000, init_size = 8000, max_iter = 300, n_init = 5)
 
 for i, filename in enumerate(train_files):
   with open(filename, 'r') as f:
@@ -42,7 +48,8 @@ for i, filename in enumerate(train_files):
    
 
     print "# samples = %d, # features = %d" % x_train.shape
-    assert x_train.shape[0] == y_train.shape[0], "x_train: %s, y_train: %s" % (x_train.shape, y_train.shape)
+    n_samples = x_train.shape[0]
+    assert n_samples == y_train.shape[0], "x_train: %s, y_train: %s" % (x_train.shape, y_train.shape)
     
     t = time.time()
     #coarse_y = y_train / 100
@@ -52,6 +59,9 @@ for i, filename in enumerate(train_files):
       coarse_y = kmeans.fit_predict(x_train)
     else:
       coarse_y = kmeans.predict(x_train)
+    print "coarse_y", coarse_y[:100]
+    for j in xrange(k):
+      print "Num in cluster %d: %d" % (j, np.sum(coarse_y == j))
     #coarse_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
     #print "Training coarse classifier..." 
     #coarse_clf.fit(x_train, coarse_y)
@@ -59,15 +69,18 @@ for i, filename in enumerate(train_files):
     #print "Coarse accuracy = %0.4f" % coarse_accuracy
     #coarse_classifiers.append(coarse_clf)
     
-    for i in xrange(k):
-      mask = (coarse_y == i)
+    for j in xrange(k):
+      mask = (coarse_y == j)
       fine_x = x_train[mask]
-      fine_y = y_train[mask]
-      fine_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
-      print "Training fine classifier for label range %d to %d (n_samples = %d)" % (start_label, stop_label, fine_x.shape[0])
-      fine_clf.fit(fine_x, fine_y)
-      assert fine_clf.n_classes_ == 1000, "Expected 1000 classes but got %d" % fine_clf.n_classes_
-      fine_classifiers[i].append(fine_clf)
+      if fine_x.shape[0] > 0:
+        print "Training fine classifier for coarse label %d with %d samples" % (j, fine_x.shape[0])
+        fine_y = y_train[mask]
+        fine_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
+        fine_clf.fit(fine_x, fine_y)
+        # assert fine_clf.n_classes_ == 1000, "Expected 1000 classes but got %d" % fine_clf.n_classes_ 
+        fine_classifiers[i].append(fine_clf)
+      else:
+        print "Skipping coarse label %d" % j 
     print "Elapsed time = %0.4f" % (time.time() - t)
     print 
 
@@ -75,7 +88,7 @@ for i, filename in enumerate(train_files):
 del x_train 
 del y_train 
 
-def predict(x):
+def predict(x, y = None):
   n_samples = x.shape[0]
  
   #coarse_probs = coarse_classifiers[0].predict_proba(x)
@@ -100,16 +113,18 @@ def predict(x):
     #curr_coarse = coarse_probs[:, i]
     # shape of curr_coarse[:, None] is (n_samples, 1)
     #fine_probs[:, start_label:stop_label] = prob * curr_coarse[:, None]
-  pred = np.empty((n_samples,), dtype='int64')
+  pred_counts = np.zeros((n_samples, 1000), dtype='int32')
   for i in xrange(k):
     mask = coarse_labels == i
     x_subset = x[mask]
     n_subset = x_subset.shape[0]
-    prob = np.empty((n_subset, 1000), dtype='float32')
-    for j, fine_clf in enumerate(fine_clfs[i]):
-      prob += fine_clf.predict_proba(x_subset)
-    pred[mask] = np.argmax(prob, axis=1)
-  return pred 
+    if n_subset > 0:
+      for j, fine_clf in enumerate(fine_classifiers[i]):
+        fine_pred = fine_clf.predict(x_subset)
+        if y is not None:
+          print "Accuracy of cluster %d, tree %d: %0.4f" % (i, j, np.mean(fine_pred == y[mask]))
+        pred_counts[mask, fine_pred] += 1 
+  return np.argmax(pred_counts, axis=1)
     
 
 print "---" 
