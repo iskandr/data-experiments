@@ -28,7 +28,7 @@ if DEBUG:
   train_files = train_files[:1]
   max_samples_per_file = 10000
 else:
-  k = 10
+  k = 5
   n_trees = 201
   max_depth = 35
   max_samples_per_file = None
@@ -37,7 +37,7 @@ else:
 coarse_classifiers = []
 fine_classifiers = [[] for _ in xrange(k)] 
 
-kmeans = MiniBatchKMeans(n_clusters = k, batch_size = 1000, init_size = 8000, max_iter = 300, n_init = 5)
+kmeans = MiniBatchKMeans(n_clusters = k, batch_size = 1000, init_size = 8000, max_iter = 300, n_init = 5, init='random')
 
 for i, filename in enumerate(train_files):
   with open(filename, 'r') as f:
@@ -78,7 +78,7 @@ for i, filename in enumerate(train_files):
         fine_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
         fine_clf.fit(fine_x, fine_y)
         # assert fine_clf.n_classes_ == 1000, "Expected 1000 classes but got %d" % fine_clf.n_classes_ 
-        fine_classifiers[i].append(fine_clf)
+        fine_classifiers[j].append(fine_clf)
       else:
         print "Skipping coarse label %d" % j 
     print "Elapsed time = %0.4f" % (time.time() - t)
