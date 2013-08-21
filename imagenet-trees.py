@@ -1,0 +1,135 @@
+import cPickle
+import numpy as np
+import sklearn  
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.tree import DecisionTreeClassifier 
+from sklearn.linear_model import SGDClassifier 
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier, ExtraTreesClassifier, GradientBoostingClassifier
+import glob 
+import time 
+
+
+DEBUG = True
+
+from PyWiseRF import WiseRF 
+Ensemble = WiseRF
+
+train_files = list(glob.glob('/scratch1/imagenet-pickle/train-data.pickle.*'))
+
+if DEBUG:
+  k = 2
+  n_trees = 1 
+  max_depth = 1
+  train_files = train_files[:1]
+  max_samples_per_file = 100000
+else:
+  k = 2 
+  n_trees = 201
+  max_depth = 35
+  max_samples_per_file = None
+  
+kmeans = MiniBatchKMeans(n_clusters = k)
+
+coarse_classifiers = []
+fine_classifiers = [[] for _ in xrange(k)] 
+
+for i, filename in enumerate(train_files):
+  with open(filename, 'r') as f:
+    print "Loading %s..." % filename
+    d = cPickle.load(f)
+    x_train = d['fc'][:max_samples_per_file, :]
+    y_train = np.ravel(d['labels']).astype('int32')[:max_samples_per_file]
+   
+
+    print "# samples = %d, # features = %d" % x_train.shape
+    assert x_train.shape[0] == y_train.shape[0], "x_train: %s, y_train: %s" % (x_train.shape, y_train.shape)
+    
+    t = time.time()
+    #coarse_y = y_train / 100
+   
+    if i == 0:
+      print "Running clustering..." 
+      coarse_y = kmeans.fit_predict(x_train)
+    else:
+      coarse_y = kmeans.predict(x_train)
+    #coarse_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
+    #print "Training coarse classifier..." 
+    #coarse_clf.fit(x_train, coarse_y)
+    #coarse_accuracy = np.mean(coarse_clf.predict(x_train) == coarse_y)
+    #print "Coarse accuracy = %0.4f" % coarse_accuracy
+    #coarse_classifiers.append(coarse_clf)
+    
+    for i in xrange(k):
+      mask = (coarse_y == i)
+      fine_x = x_train[mask]
+      fine_y = y_train[mask]
+      fine_clf = Ensemble(n_estimators = n_trees, max_depth = max_depth)
+      print "Training fine classifier for label range %d to %d (n_samples = %d)" % (start_label, stop_label, fine_x.shape[0])
+      fine_clf.fit(fine_x, fine_y)
+      assert fine_clf.n_classes_ == 1000, "Expected 1000 classes but got %d" % fine_clf.n_classes_
+      fine_classifiers[i].append(fine_clf)
+    print "Elapsed time = %0.4f" % (time.time() - t)
+    print 
+
+
+del x_train 
+del y_train 
+
+def predict(x):
+  n_samples = x.shape[0]
+ 
+  #coarse_probs = coarse_classifiers[0].predict_proba(x)
+  #assert coarse_probs.shape == (n_samples, 10)
+  #for coarse_clf in coarse_classifiers[1:]:
+  #  coarse_probs += coarse_clf.predict_proba(x)
+  # coarse_probs /= len(coarse_classifiers)
+  #coarse_labels = kmeans.predict
+  #print "Example coarse probs:", coarse_probs[:20]
+  # max_coarse = np.argmax(coarse_probs, axis=1)
+  #fine_probs = np.empty((n_samples, 1000), dtype='float32')
+  #prob = np.empty((n_samples, 100), dtype='float32')
+  coarse_labels = kmeans.predict(x)
+  #for i in xrange(10):
+    #prob.fill(0)
+    #print "Label group %d / 10" % (i+1,)
+    #curr_clfs = fine_classifiers[i]
+    #for j, fine_clf in enumerate(curr_clfs):
+    #  print "  Classifier %d / %d..." % (j+1, len(curr_clfs)) 
+    #  prob += fine_clf.predict_proba(x)
+    # shape of prob is  (n_samples, 100)
+    #curr_coarse = coarse_probs[:, i]
+    # shape of curr_coarse[:, None] is (n_samples, 1)
+    #fine_probs[:, start_label:stop_label] = prob * curr_coarse[:, None]
+  pred = np.empty((n_samples,), dtype='int64')
+  for i in xrange(k):
+    mask = coarse_labels == i
+    x_subset = x[mask]
+    n_subset = x_subset.shape[0]
+    prob = np.empty((n_subset, 1000), dtype='float32')
+    for j, fine_clf in enumerate(fine_clfs[i]):
+      prob += fine_clf.predict_proba(x_subset)
+    pred[mask] = np.argmax(prob, axis=1)
+  return pred 
+    
+
+print "---" 
+total_correct = 0 
+total_test = 0
+for filename in glob.glob('/scratch1/imagenet-pickle/test-data.pickle.*'):
+  with open(filename, 'r') as f:
+    print "Loading %s..." % filename
+    d = cPickle.load(f)
+    x_test = d['fc']
+    y_test = np.ravel(d['labels']).astype('int32')
+    print "# samples = %d, # features = %d" % x_test.shape
+    n_samples = x_test.shape[0]
+    print "Evaluating..." 
+    pred = predict(x_test)
+    n_correct = np.sum(y_test == pred)
+    print "Accuracy = %0.4f (%d / %d)" % (float(n_correct) / n_samples, n_correct, n_samples)
+    total_test += n_samples
+    total_correct += n_correct
+    print 
+
+print "---" 
+print "Overall accuracy = %0.4f (%d / %d)" % (float(total_correct) / total_test, total_correct, total_test)

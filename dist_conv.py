@@ -4,7 +4,7 @@ import numpy as np
 import pycuda
 import pycuda.autoinit 
 
-from striate import ConvNet, dot, norm, concat, mean, weighted_mean  
+from striate import ConvNet, dot, norm, concat, mean, weighted_mean, argmax  
 
 class DistConvNet(object):
   def __init__(self, 
@@ -13,8 +13,9 @@ class DistConvNet(object):
                pretrain_epochs = 0, # how many pure SGD passes?
                posttrain_epochs = 10,  # how many cleanup SGD passes?  
                n_out = 10, # how many outputs?  
-               n_filters = [128, 96], # how many convolutions in the first two layers of the network?  
-               filter_size = [7,7], 
+               n_filters = [64, 64], # how many convolutions in the first two layers of the network?  
+               filter_size = [5,5],
+               n_hidden = [200, 100],  
                global_learning_rate = 'search',  # step size for big steps of combined gradients
                local_learning_rate = 0.1,  # step size on each worker
                global_momentum = 0.05,  # momentum of global updates
@@ -115,6 +116,9 @@ class DistConvNet(object):
       for i in xrange(1, self.n_workers):
         self.nets[0].set_weights(w)
      
+
+    best_val_acc = 0
+    n_acc_decreases = 0
     for epoch in xrange(self.n_epochs):       
       if shuffle: train_set_x, train_set_y = get_shuffled_set()
       start_idx = 0 
@@ -194,7 +198,8 @@ class DistConvNet(object):
               #print "  -- gradient shape", g.shape
               rhos = []
               alphas = []
-              if self.global_learning_rate != 'search':
+              normalize_grad = True # self.global_learning_rate != 'search
+              if normalize_grad:
                 norm_before = norm(g) #np.sqrt(dot(g,g))
               for (s,y) in zip(ss,ys):
                   rho = 1.0 / dot(s,y)
@@ -213,7 +218,7 @@ class DistConvNet(object):
               # if we don't have a line search, 
               # should normalize the search direction 
               # since it can grow several orders of magnitude 
-              if self.global_learning_rate != 'search':
+              if normalize_grad:
                 norm_after = norm(g) 
                 rescale_gradient = norm_before / norm_after 
           elif self.newton_method == 'svd':
@@ -241,8 +246,10 @@ class DistConvNet(object):
               
               Y = Y.get()
               g = g.get()
-               
-              V,D,U = np.linalg.svd(Y, full_matrices=False)
+              try: 
+                V,D,U = np.linalg.svd(Y, full_matrices=False)
+              except np.linalg.linalg.LinAlgError:
+                return time.clock() - start_time 
               cutoff = 0.0001 * D[0]
               if D.min() < cutoff:
                 k = argmax(D < cutoff)
@@ -261,38 +268,59 @@ class DistConvNet(object):
           if self.global_learning_rate == 'search':
             val_x, val_y = get_validation_set()
             etas = [1000,  100, 10, 1, .1, .01, .001]
-            ws = []
             w_best = w
-            eta_best = 0 
-            cost_best = np.inf
+            if self.global_decay != 1:
+              w_best *= self.global_decay
+            eta_best = 0
+            best_acc =  self.score(val_x, val_y)
+            best_norm = norm(w) 
+            
             for eta in etas:
               w_candidate = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
               
               self.nets[0].set_weights(w_candidate)
-              cost = self.nets[0].average_cost(val_x, val_y)
+              #cost = self.nets[0].average_cost(val_x, val_y)
+              acc = self.score(val_x, val_y)
+               
               # print "   %0.6f ==> %0.6f" % (eta, cost)
-              if cost < cost_best:
-                cost_best = cost
+              if acc > best_acc:
+                best_acc = acc
+                best_norm = norm(w_candidate) 
                 w_best = w_candidate
-                eta_best = eta 
+                eta_best = eta
+              elif acc == best_acc:
+                curr_norm = norm(w_candidate)
+                if curr_norm < best_norm:
+                  best_norm = curr_norm
+                  eta_best = eta
+                  w_best = w_candidate
+                
             w = w_best
-            print "  -- best step size", eta_best, "step norm", (eta*rescale_gradient)*norm(g)
+            if eta_best == 0:
+              print "  -- Warning: step size = %s, acc = %0.3f norm = %s" % (eta_best, best_acc, best_norm)
           else:
             eta = self.global_learning_rate
             w  = w.mul_add(self.global_decay, g, -eta * rescale_gradient)
           for worker_idx in xrange(self.n_workers):
             self.nets[worker_idx].set_weights(w)
-      print "Epoch %d -- validation accuracy = %0.3f" % (epoch, self.score(acc_val_x, acc_val_y) * 100)
-
+      val_acc = self.score(acc_val_x, acc_val_y)
+      if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        n_acc_decreases = 0
+      else:
+        n_acc_decreases += 1 
+      print "Epoch %d -- validation accuracy = %0.3f" % (epoch, val_acc)
+      if n_acc_decreases > 3:
+        print "Seems to have stopped improving"
+        return time.clock() - start_time 
+           
     for epoch in xrange(self.posttrain_epochs):
       print "Posttraining epoch", epoch 
       train_set_x, train_set_y = get_shuffled_set()
       self.nets[0].fit(train_set_x, train_set_y)
       print "  -- validation accuracy = %0.3f" % (self.score(acc_val_x, acc_val_y) * 100)
-    end_time = time.clock()
-    elapsed = end_time - start_time 
-    return elapsed 
-
+    return time.clock() - start_time
+  
   def score(self, test_set_x, test_set_y):
     """
     Return average accuracy on the test set

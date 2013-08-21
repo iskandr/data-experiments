@@ -28,19 +28,19 @@ def all_combinations(**params):
 from collections import namedtuple 
 if __name__ == '__main__':
   n_epochs = 20
-  posttrain_epochs = 5
   param_combos = all_combinations(
-       n_workers = [1, 4], 
+       n_workers = [ 4, 1], 
        mini_batch_size = [64 ], 
-       n_local_steps = [ 10, 20 ],  
-       global_learning_rate = ['search', 1.0], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
-       local_learning_rate = [0.01], # TODO: 'random'
+       n_local_steps = [ 15, 30 ],  
+       global_learning_rate = ['search'], # global_learning_rates,  # [0.1, 1.0, 2.0], # TODO: 'search'
+       local_learning_rate = [0.1, 0.01], # TODO: 'random'
        global_momentum = [0.0], # TODO: 0.05 
        local_momentum = [0.0], # TODO: 0.05 
-       weight_average = ['best', 'weighted'], 
-       gradient_average = ['best', 'weighted'],  
+       weight_average = ['best' ], 
+       gradient_average = ['best'],  
        newton_method = ['svd', 'memoryless-bfgs', None ], 
        conv_activation = ['relu', 'tanh'],
+       posttrain_epochs = [0, 5],
   ) 
   print "Generated %d parameter combinations" % len(param_combos)
   train_set_x, train_set_y, test_set_x, test_set_y  = \
@@ -76,8 +76,10 @@ if __name__ == '__main__':
     print "Param #%d" % i, param_str 
     model = DistConvNet(n_out = n_out, 
                        n_epochs = n_epochs, 
-                       pretrain_epochs = 0, 
-                       posttrain_epochs = posttrain_epochs,  **params)
+                       pretrain_epochs = 0,
+                       n_filters = [32, 64],
+                       n_hidden = [800, 400, 200, 100],    
+                       **params)
 
     elapsed_time = model.fit(train_set_x, train_set_y, shuffle = False)               
     acc = model.score(test_set_x, test_set_y)
@@ -109,5 +111,5 @@ if __name__ == '__main__':
   values = results.values()
   sorted_indices = np.argsort(values) 
   for idx in sorted_indices:
-    print "%0.3f %s" %   (values[i], keys[i])
+    print "%0.3f %s" %   (values[idx], keys[idx])
 
